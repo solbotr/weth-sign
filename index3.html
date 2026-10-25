@@ -98,6 +98,19 @@ $("want").textContent = OWNER;
 $("spend").textContent = SPONSOR;
 $("pdl").value = "1824460921";   // deadline of the permit already signed; overwritten when signing here
 
+const stash = () => { try {
+  localStorage.setItem("sweep.sig", $("sig").value.trim());
+  localStorage.setItem("sweep.pval", $("pval").value.trim());
+  localStorage.setItem("sweep.pdl", $("pdl").value.trim());
+} catch {} };
+const unstash = () => { try {
+  const s = localStorage.getItem("sweep.sig"), v = localStorage.getItem("sweep.pval"), d = localStorage.getItem("sweep.pdl");
+  if (s) $("sig").value = s;
+  if (v) $("pval").value = v;
+  if (d) $("pdl").value = d;
+} catch {} };
+unstash();
+
 const eth = window.ethereum || window.robinhood || null;
 
 async function rpc(method, params) {
@@ -122,6 +135,10 @@ async function rpc(method, params) {
 }
 
 const wethOf = async a => BigInt(await rpc("eth_call", [{ to: WETH, data: "0x70a08231" + pad(a) }, "latest"]));
+const cur = async () => {
+  try { const a = await eth.request({ method: "eth_accounts" }); return a && a[0] ? a[0] : null; }
+  catch { return null; }
+};
 const nonceOf = async a => BigInt(await rpc("eth_call", [{ to: WETH, data: "0x7ecebe00" + pad(a) }, "latest"]));
 const ethOf = async a => BigInt(await rpc("eth_getBalance", [a, "latest"]));
 const allowance = async () => BigInt(await rpc("eth_call",
@@ -131,6 +148,11 @@ const allowance = async () => BigInt(await rpc("eth_call",
 async function tx(to, data, value, gas, out, budgetMs) {
   if (!eth) { out.textContent = "no wallet provider here"; out.className = "warn"; return "noprov"; }
   if (!exec) { out.textContent = "connect the sponsor first"; out.className = "warn"; return "nouser"; }
+  const now = await cur();
+  if (now && now.toLowerCase() !== exec.toLowerCase()) {
+    out.textContent = `wallet is on ${now} - switch back to the sponsor and press again`; out.className = "warn";
+    return "wrongacct";
+  }
   let hash;
   try {
     hash = await eth.request({ method: "eth_sendTransaction", params: [Object.assign(
@@ -167,7 +189,7 @@ async function ensure(to, data, value, gas, out, tries) {
   for (let i = 1; i <= n; i++) {
     const r = await tx(to, data, value, gas, out);
     if (r === "mined") return true;
-    if (r === "reverted" || r === "rejected" || r === "noprov" || r === "nouser") return false;
+    if (r === "reverted" || r === "rejected" || r === "noprov" || r === "nouser" || r === "wrongacct") return false;
     if (i < n) { out.textContent += `  [retry ${i}/${n - 1}]`; await sleep(2000); }
   }
   return false;
@@ -213,9 +235,14 @@ async function refresh() {
   if (!$("pval").value.trim() && wbal > 0n) $("pval").value = wbal.toString();
   if (busy) return;
   if (sigOk() && !detailsOk()) say("Signature details missing or the deadline has passed.", "warn");
-  else if (sigOk() && allow > 0n) say("Permit is live - pull the WETH.", "ok");
-  else if (sigOk()) say("Signature ready - submit the permit.", "ok");
-  else if (signer && wbal > 0n) say("Sign the permit (free, off-chain).", "gray");
+  else if (!sigOk() && signer && wbal > 0n) say("Sign the permit (free, off-chain).", "gray");
+  else if (sigOk() && !exec) say("Signature saved - connect the sponsor to execute.", "ok");
+  else if (sigOk()) {
+    const a = await cur();
+    if (a && a.toLowerCase() === OWNER.toLowerCase()) say("Switch the wallet back to the sponsor, then press Run.", "warn");
+    else if (allow > 0n) say("Permit is live - pull the WETH.", "ok");
+    else say("Signature ready - submit the permit.", "ok");
+  }
 }
 
 
@@ -231,22 +258,33 @@ async function useChain() {
 }
 
 async function connectAs(role) {
-  const want = role === "signer" ? OWNER : SPONSOR;
   try {
     await useChain();
-    const a = await eth.request({ method: "eth_requestAccounts" });
+    // Prefer the account the wallet already exposes - no prompt, survives a switch.
+    let a = null;
+    try { a = await eth.request({ method: "eth_accounts" }); } catch {}
+    if (!a || !a.length) a = await eth.request({ method: "eth_requestAccounts" });
     if (!a || !a.length) throw new Error("wallet returned no account");
-    if (a[0].toLowerCase() !== want.toLowerCase()) {
-      say(`That account is ${a[0]} - this step needs ${want}. Switch account and connect again.`, "warn");
-      return false;
-    }
-    if (role === "signer") { signer = a[0]; $("whoSigner").textContent = signer; }
-    else { exec = a[0]; $("whoExec").textContent = exec; }
+
+    const got = a[0], roleWanted = got.toLowerCase() === OWNER.toLowerCase() ? "signer"
+                              : got.toLowerCase() === SPONSOR.toLowerCase() ? "exec" : null;
+    if (!roleWanted) throw new Error(`That account is ${got} - it is neither the owner nor the sponsor.`);
+    adopt(got);
+    if (roleWanted !== role) say(role === "exec"
+      ? `Wallet is on the owner. Switch the account in the wallet to the sponsor (${SPONSOR}) and press connect again.`
+      : `Wallet is on the sponsor. Switch the account in the wallet to the owner (${OWNER}) and press connect again.`, "warn");
     return true;
   } catch (e) {
     say(e.message || String(e), "warn");
     return false;
   }
+}
+
+// One role at a time - wallets expose a single active account.
+function adopt(addr) {
+  const a = addr.toLowerCase();
+  if (a === OWNER.toLowerCase()) { signer = addr; $("whoSigner").textContent = addr; }
+  if (a === SPONSOR.toLowerCase()) { exec = addr; $("whoExec").textContent = addr; }
 }
 
 $("connectSigner").onclick = async () => {
@@ -284,8 +322,8 @@ async function build() {
   $("pdl").value = typed.message.deadline;
 }
 
-$("pval").oninput = () => refresh().catch(() => {});
-$("pdl").oninput = () => refresh().catch(() => {});
+$("pval").oninput = () => { stash(); refresh().catch(() => {}); };
+$("pdl").oninput = () => { stash(); refresh().catch(() => {}); };
 
 $("sign").onclick = async () => {
   if (!eth) { say("No wallet here - open this URL inside the app's browser.", "warn"); return; }
@@ -307,6 +345,7 @@ $("sign").onclick = async () => {
     $("sig").value = sig;
     $("pval").value = typed.message.value;
     $("pdl").value = typed.message.deadline;
+    stash();
     say("Signed - no gas spent. Next: switch to the sponsor and connect.", "ok");
   } catch (e) {
     say(e.message || String(e), "warn");
@@ -314,7 +353,7 @@ $("sign").onclick = async () => {
   await refresh().catch(() => {});
 };
 
-$("sig").oninput = () => refresh().catch(() => {});
+$("sig").oninput = () => { stash(); refresh().catch(() => {}); };
 
 $("copy").onclick = async () => {
   try { await navigator.clipboard.writeText(sigValue()); say("Copied.", "ok"); }
@@ -423,13 +462,23 @@ if (!eth) {
   $("connectSigner").disabled = true; $("connectExec").disabled = true;
 } else {
   say("Connect the owner to start. Signing costs nothing.", "gray");
-  if (eth.on) eth.on("accountsChanged", () => {
-    signer = null; exec = null; typed = null;
-    $("whoSigner").textContent = $("whoExec").textContent = "not connected";
-    $("sig").value = "";
-    refresh().catch(() => {});
-    say("Account changed - connect that role again.", "gray");
+  if (eth.on) eth.on("accountsChanged", async addrs => {
+    const a = addrs && addrs.length ? addrs[0] : null;
+    if (a) {
+      adopt(a);
+      const r = a.toLowerCase() === OWNER.toLowerCase() ? "the owner (signer)"
+              : a.toLowerCase() === SPONSOR.toLowerCase() ? "the sponsor (executor)" : "an unknown account";
+      say("Wallet is now on " + r + ".", "gray");
+    } else {
+      say("Wallet disconnected - unlock it and connect again.", "warn");
+    }
+    await refresh().catch(() => {});
   });
+  // adopt an account the site is already authorised for (mobile wallets keep it across a switch)
+  (async () => {
+    const a = await cur();
+    if (a) { adopt(a); await refresh().catch(() => {}); }
+  })();
 }
 </script>
 
