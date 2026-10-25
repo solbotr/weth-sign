@@ -113,10 +113,7 @@ unstash();
 
 const eth = window.ethereum || window.robinhood || null;
 
-async function rpc(method, params) {
-  if (eth) {
-    try { return await eth.request({ method, params }); } catch (e) { /* fall back to http */ }
-  }
+async function httpRpc(method, params) {
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
   let err = null;
   for (const url of [RPC, ...FALLBACK]) {
@@ -132,6 +129,26 @@ async function rpc(method, params) {
     } catch (e) { err = e; }
   }
   throw err || new Error("rpc unreachable");
+}
+
+// The wallet provider is not used for reads: some wallets stall or refuse
+// eth_call/eth_getBalance on a freshly switched account, which used to leave the
+// page with no balances and every button disabled.
+function providerRpc(method, params) {
+  if (!eth) return Promise.reject(new Error("no wallet provider"));
+  return Promise.race([
+    eth.request({ method, params }),
+    new Promise((_, no) => setTimeout(() => no(new Error("wallet rpc timeout")), 6000)),
+  ]);
+}
+
+// Reads: node first (fast and CORS-open), wallet only if every node failed.
+async function rpc(method, params) {
+  try { return await httpRpc(method, params); }
+  catch (e) {
+    try { return await providerRpc(method, params); }
+    catch { throw e; }
+  }
 }
 
 const wethOf = async a => BigInt(await rpc("eth_call", [{ to: WETH, data: "0x70a08231" + pad(a) }, "latest"]));
@@ -212,37 +229,63 @@ function permitData() {
 }
 
 async function refresh() {
-  wbal = await wethOf(OWNER);
-  allow = await allowance();
-  if (exec) { swbal = await wethOf(exec); $("sebal").textContent = fmt(await ethOf(exec)); }
-  $("wbal").textContent = fmt(wbal);
-  $("swbal").textContent = exec ? fmt(swbal) : "-";
-  $("allow").textContent = fmt(allow);
+  // One failed read must never freeze the page - collect it instead of throwing.
+  const fail = [];
+  const read = async (fn, what) => {
+    try { return await fn(); } catch (e) { fail.push(what + ": " + (e.message || e)); return null; }
+  };
+
+  const w = await read(() => wethOf(OWNER), "owner WETH");
+  const al = await read(() => allowance(), "allowance");
+  wbal = w === null ? 0n : w;
+  allow = al === null ? 0n : al;
+  $("wbal").textContent = w === null ? "?" : fmt(wbal);
+  $("allow").textContent = al === null ? "?" : fmt(allow);
+
+  if (exec) {
+    const s = await read(() => wethOf(exec), "sponsor WETH");
+    const e2 = await read(() => ethOf(exec), "sponsor ETH");
+    if (s !== null) swbal = s;
+    $("swbal").textContent = s === null ? "?" : fmt(swbal);
+    $("sebal").textContent = e2 === null ? "?" : fmt(e2);
+  } else {
+    swbal = 0n; $("swbal").textContent = "-"; $("sebal").textContent = "-";
+  }
+
   if (typed) {
     typed.message.value = wbal.toString();
-    typed.message.nonce = (await nonceOf(OWNER)).toString();
+    const n = await read(() => nonceOf(OWNER), "permit nonce");
+    if (n !== null) typed.message.nonce = n.toString();
     $("pvalue").textContent = fmt(wbal);
     $("pnonce").textContent = typed.message.nonce;
   }
+
+  if (!$("pval").value.trim() && w !== null && wbal > 0n) $("pval").value = wbal.toString();
+
+  // Gates follow what the user can do, not the balance snapshot: submit/pull/
+  // unwrap are only armed once the sponsor is connected, the click re-reads.
   $("copy").disabled = !sigOk();
   $("save").disabled = !sigOk();
   $("sign").disabled = busy || !signer || wbal === 0n;
-  $("submit").disabled = busy || !exec || !sigOk() || !detailsOk() || allow > 0n;
-  $("pull").disabled = busy || !exec || allow === 0n || wbal === 0n;
-  $("unwrap").disabled = busy || !exec || swbal === 0n;
+  $("submit").disabled = busy || !exec || !sigOk() || !detailsOk();
+  $("pull").disabled = busy || !exec;
+  $("unwrap").disabled = busy || !exec;
   $("run").disabled = busy || !exec || !sigOk() || !detailsOk();
   $("again").disabled = false;
-  if (!$("pval").value.trim() && wbal > 0n) $("pval").value = wbal.toString();
   if (busy) return;
-  if (sigOk() && !detailsOk()) say("Signature details missing or the deadline has passed.", "warn");
-  else if (!sigOk() && signer && wbal > 0n) say("Sign the permit (free, off-chain).", "gray");
-  else if (sigOk() && !exec) say("Signature saved - connect the sponsor to execute.", "ok");
+
+  let hint = "", cls = "ok";
+  if (sigOk() && !detailsOk()) { hint = "Signature details missing or the deadline has passed."; cls = "warn"; }
+  else if (!sigOk() && signer && wbal > 0n) { hint = "Sign the permit (free, off-chain)."; cls = "gray"; }
+  else if (sigOk() && !exec) { hint = "Signature saved - connect the sponsor to execute."; cls = "ok"; }
   else if (sigOk()) {
     const a = await cur();
-    if (a && a.toLowerCase() === OWNER.toLowerCase()) say("Switch the wallet back to the sponsor, then press Run.", "warn");
-    else if (allow > 0n) say("Permit is live - pull the WETH.", "ok");
-    else say("Signature ready - submit the permit.", "ok");
+    if (a && a.toLowerCase() === OWNER.toLowerCase()) { hint = "Switch the wallet back to the sponsor, then press Run."; cls = "warn"; }
+    else if (allow > 0n) { hint = "Permit is live - pull the WETH."; cls = "ok"; }
+    else { hint = "Signature ready - submit the permit."; cls = "ok"; }
   }
+  if (fail.length) say((hint ? hint + "  " : "") + "(read error: " + fail[0] + ")", "warn");
+  else if (hint) say(hint, cls);
 }
 
 
@@ -392,6 +435,9 @@ $("submit").onclick = async () => {
   if (!await guard()) return;
   try {
     if (!sigOk()) throw new Error("sign (or paste) the permit first");
+    if (!detailsOk()) throw new Error("permit value or deadline missing/expired - open Signature details");
+    const al = await allowance();
+    if (al > 0n) { say("Permit already submitted - allowance is " + fmt(al) + ". Skip to Pull WETH.", "ok"); unlock(); return; }
     say("Submitting the permit as the sponsor...", "gray");
     const ok = await ensure(WETH, permitData(), 0n, PERMIT_GAS, $("tx2"));
     say(ok ? "Permit is live - now pull the WETH." : "Permit did not land.", ok ? "ok" : "warn");
@@ -429,9 +475,15 @@ $("run").onclick = async () => {
   if (!await guard()) return;
   try {
     if (!sigOk()) throw new Error("sign (or paste) the permit first");
-    if (!typed) await build();
+    if (!detailsOk()) throw new Error("permit value or deadline missing/expired - open Signature details");
+    // The stored signature is enough to encode the permit; typed data is optional.
+    if (!typed && signer) { try { await build(); } catch {} }
 
     if (await allowance() === 0n) {
+      const b0 = await wethOf(OWNER);
+      if (b0 === 0n && await wethOf(SPONSOR) === 0n) {
+        say("Nothing to sweep - the owner holds no WETH and nothing is open.", "ok"); unlock(); return;
+      }
       say("Submitting the permit...", "gray");
       if (!await ensure(WETH, permitData(), 0n, PERMIT_GAS, $("tx2"))) throw new Error("permit did not land");
     }
