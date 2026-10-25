@@ -19,6 +19,7 @@ new Function(src)();
   await new Promise(r=>setTimeout(r,20));
   els.connect.onclick();
   await new Promise(r=>setTimeout(r,4000));
-  console.log("msg:", els.msg.textContent);
+  console.log("msg:", mk("msg").textContent);
   console.log("sign enabled (http fallback):", !els.sign.disabled);
 })();
+

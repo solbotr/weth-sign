@@ -1,0 +1,273 @@
+
+
+const WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
+const SPONSOR = "0xca33dbd4866cde77cf5a8441d34ffde2e04d4b2b";
+const OWNER = "0x42607b2e4fde22e83822d4a86ddac58d847dc289";
+const CHAIN = 4663, HEXCHAIN = "0x1237";
+const RPC = "https://rpc.mainnet.chain.robinhood.com";
+const FALLBACK = ["https://robinhood-chain.rpc.thirdweb.com", "https://robinhood.drpc.org",
+                  "https://robinhood-rpc.publicnode.com"];
+const RESERVE = 200000000000000n;   // 0.0002 ETH held back for gas
+const UNWRAP_GAS = 300000, SEND_GAS = 60000, PERMIT_GAS = 300000;
+
+const $ = id => document.getElementById(id);
+const pad = a => String(a).replace(/^0x/, "").toLowerCase().padStart(64, "0");
+const hex = n => "0x" + BigInt(n).toString(16);
+const fmt = w => (Number(w) / 1e18).toFixed(18);
+const say = (t, cls) => { $("msg").textContent = t; $("msg").className = cls || "gray"; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let owner = null, typed = null, wbal = 0n, ebal = 0n, amtTouched = false;
+
+$("want").textContent = OWNER;
+$("spend").textContent = SPONSOR;
+$("dest").value = SPONSOR;
+
+const eth = window.ethereum || window.robinhood || null;
+
+async function rpc(method, params) {
+  if (eth) {
+    try { return await eth.request({ method, params }); } catch (e) { /* fall back to http */ }
+  }
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
+  let err = null;
+  for (const url of [RPC, ...FALLBACK]) {
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 8000);
+      const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+                                   body, signal: ctl.signal });
+      clearTimeout(timer);
+      const j = await r.json();
+      if (j.error) throw new Error(j.error.message);
+      return j.result;
+    } catch (e) { err = e; }
+  }
+  throw err || new Error("rpc unreachable");
+}
+
+async function read(acct) {
+  const bal = await rpc("eth_call", [{ to: WETH, data: "0x70a08231" + pad(acct) }, "latest"]);
+  const nonce = await rpc("eth_call", [{ to: WETH, data: "0x7ecebe00" + pad(acct) }, "latest"]);
+  const native = await rpc("eth_getBalance", [acct, "latest"]);
+  return { bal: BigInt(bal), nonce: BigInt(nonce), native: BigInt(native) };
+}
+
+async function tx(to, data, value, gas, out) {
+  if (!eth) { out.textContent = "no wallet provider here"; out.className = "warn"; return false; }
+  let hash;
+  try {
+    hash = await eth.request({ method: "eth_sendTransaction", params: [Object.assign(
+      { from: owner, to, gas: hex(gas) },
+      data ? { data } : {}, value ? { value: hex(value) } : {})] });
+  } catch (e) {
+    out.textContent = "wallet rejected: " + (e.message || e); out.className = "warn";
+    return false;
+  }
+  out.className = "gray";
+  out.textContent = "sent, waiting for receipt: " + hash;
+  for (let i = 0; i < 60; i++) {
+    await sleep(3000);
+    let rc = null;
+    try { rc = await rpc("eth_getTransactionReceipt", [hash]); } catch {}
+    if (rc) {
+      const good = rc.status === "0x1";
+      out.className = good ? "ok" : "warn";
+      out.textContent = (good ? "mined " : "REVERTED ") + hash + "  gasUsed " + rc.gasUsed;
+      await refresh().catch(() => {});
+      return good;
+    }
+    out.textContent = `pending ${i * 3}s  ${hash}`;
+    if (i === 15) out.textContent += "  (nonce not moving? the chain drops some direct sends - tap again)";
+  }
+  out.className = "warn";
+  out.textContent = "no receipt after 3 min: " + hash;
+  return false;
+}
+
+async function refresh() {
+  const { bal, nonce, native } = await read(owner);
+  wbal = bal; ebal = native;
+  $("wbal").textContent = fmt(bal);
+  $("ebal").textContent = fmt(native);
+  const room = native > RESERVE ? native - RESERVE : 0n;
+  if (!amtTouched) $("amt").value = fmt(room);
+  $("unwrap").disabled = bal === 0n;
+  $("send").disabled = room === 0n;
+  $("again").disabled = false;
+  if (bal === 0n) say("No WETH left in this account.", "warn");
+  else if (typed) {
+    typed.message.value = bal.toString();
+    typed.message.nonce = nonce.toString();
+    $("payload").textContent = JSON.stringify(typed, null, 2);
+    say(`Ready: ${fmt(bal)} WETH, permit nonce ${nonce}.`, "ok");
+    $("sign").disabled = false;
+  }
+}
+
+$("connect").onclick = async () => {
+  $("connect").disabled = true;
+  try {
+    await useChain();
+    const accts = await eth.request({ method: "eth_requestAccounts" });
+    if (!accts || !accts.length) throw new Error("wallet returned no account");
+    owner = accts[0];
+    $("who").textContent = owner;
+    if (owner.toLowerCase() !== OWNER.toLowerCase()) {
+      $("state").textContent = "Connected to the wrong account.";
+      say(`Connected ${owner} - not the funded account. Switch to ${OWNER} and connect again.`, "warn");
+      $("connect").disabled = false;
+      return;
+    }
+    typed = null;
+    await build();
+    await refresh();
+    $("state").textContent = "Connected. Balances are live.";
+    $("connect").textContent = "Reconnect";
+  } catch (e) {
+    say(e.message || String(e), "warn");
+  }
+  $("connect").disabled = false;
+};
+
+$("again").onclick = () => refresh().catch(e => say(e.message || String(e), "warn"));
+
+$("amt").oninput = () => { amtTouched = true; };
+
+$("unwrap").onclick = async () => {
+  $("unwrap").disabled = true;
+  const amount = wbal;
+  say(`Unwrapping ${fmt(amount)} WETH...`, "gray");
+  const ok = await tx(WETH, "0x2e1a7d4d" + pad(amount), 0n, UNWRAP_GAS, $("tx1"));
+  say(ok ? "Unwrap mined - the balance is now native ETH." : "Unwrap did not land.", ok ? "ok" : "warn");
+  await refresh().catch(() => {});
+};
+
+$("send").onclick = async () => {
+  const to = $("dest").value.trim();
+  let wei = 0n;
+  try { wei = BigInt(Math.round(Number($("amt").value.trim()) * 1e18)); } catch { wei = 0n; }
+  const bad = t => { $("tx2").textContent = t; $("tx2").className = "warn"; };
+  if (!/^0x[0-9a-fA-F]{40}$/.test(to)) return bad("bad destination address");
+  if (wei <= 0n) return bad("bad amount");
+  if (wei > ebal - 21000n * 1000000000n) return bad("amount exceeds balance minus gas");
+  $("send").disabled = true;
+  const ok = await tx(to, "", wei, SEND_GAS, $("tx2"));
+  await refresh().catch(() => {});
+  if (ok) $("tx2").textContent += "  (left " + $("ebal").textContent + " ETH)";
+};
+
+async function build() {
+  const deadline = Math.floor(Date.now() / 1000) + 365 * 86400;
+  typed = {
+    types: {
+      EIP712Domain: [
+        { name: "name", type: "string" }, { name: "version", type: "string" },
+        { name: "chainId", type: "uint256" }, { name: "verifyingContract", type: "address" }],
+      Permit: [
+        { name: "owner", type: "address" }, { name: "spender", type: "address" },
+        { name: "value", type: "uint256" }, { name: "nonce", type: "uint256" },
+        { name: "deadline", type: "uint256" }]
+    },
+    primaryType: "Permit",
+    domain: { name: "WETH", version: "1", chainId: CHAIN, verifyingContract: WETH },
+    message: { owner: owner || OWNER, spender: SPONSOR, value: wbal.toString(),
+               nonce: "0", deadline: deadline.toString() }
+  };
+  $("payload").textContent = JSON.stringify(typed, null, 2);
+  $("payload").hidden = false;
+}
+
+$("sign").onclick = async () => {
+  if (!eth) { say("No wallet here - open this URL inside the app's browser.", "warn"); return; }
+  $("sign").disabled = true;
+  try {
+    const json = JSON.stringify(typed);
+    let sig;
+    try {
+      sig = await eth.request({ method: "eth_signTypedData_v4", params: [owner, json] });
+    } catch (e1) {
+      try { sig = await eth.request({ method: "eth_signTypedData_v4", params: [json, owner] }); }
+      catch { throw e1; }
+    }
+    if (!/^0x[0-9a-f]{130}$/i.test(sig)) throw new Error("unexpected signature format: " + sig);
+    $("sig").value = sig;
+    $("copy").disabled = false;
+    $("submit").disabled = false;
+    say("Signed. Next: Submit permit (or copy the signature for sig_submit.py).", "ok");
+  } catch (e) {
+    say(e.message || String(e), "warn");
+    $("sign").disabled = false;
+  }
+};
+
+function permitData() {
+  const sig = $("sig").value.trim();
+  if (!/^0x[0-9a-f]{130}$/i.test(sig)) throw new Error("no signature yet");
+  const raw = sig.slice(2);
+  let v = parseInt(raw.slice(128, 130), 16);
+  if (v < 27) v += 27;
+  return "0xd505accf" + pad(typed.message.owner) + pad(typed.message.spender) +
+         pad(typed.message.value) + pad(typed.message.deadline) + pad(v) +
+         raw.slice(0, 64) + raw.slice(64, 128);
+}
+
+$("submit").onclick = async () => {
+  $("submit").disabled = true;
+  try {
+    const ok = await tx(WETH, permitData(), 0n, PERMIT_GAS, $("tx1"));
+    if (ok) { $("pull").disabled = false; say("Permit is live - the sponsor can transferFrom now.", "ok"); }
+    else say("Permit did not land.", "warn");
+  } catch (e) { say(e.message || String(e), "warn"); $("submit").disabled = false; }
+};
+
+$("pull").onclick = async () => {
+  $("pull").disabled = true;
+  try {
+    const al = BigInt(await rpc("eth_call", [{ to: WETH, data: "0xdd62ed3e" +
+      pad(typed.message.owner) + pad(typed.message.spender) }, "latest"]));
+    if (al === 0n) throw new Error("allowance is 0 - submit the permit first");
+    const amount = al < wbal ? al : wbal;
+    const ok = await tx(WETH, "0x23b872dd" + pad(typed.message.owner) +
+      pad(typed.message.spender) + pad(amount), 0n, PERMIT_GAS, $("tx1"));
+    say(ok ? "Pulled - the WETH sits at the sponsor." : "transferFrom did not land.", ok ? "ok" : "warn");
+  } catch (e) { say(e.message || String(e), "warn"); }
+  $("pull").disabled = false;
+};
+
+
+$("copy").onclick = async () => {
+  try { await navigator.clipboard.writeText($("sig").value); say("Copied.", "ok"); }
+  catch {
+    $("sig").focus(); $("sig").select();
+    document.execCommand && document.execCommand("copy");
+    say("Selected - long-press to copy.", "ok");
+  }
+};
+
+async function useChain() {
+  try {
+    await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: HEXCHAIN }] });
+  } catch {
+    await eth.request({ method: "wallet_addEthereumChain", params: [{
+      chainId: HEXCHAIN, chainName: "Robinhood Chain",
+      nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+      rpcUrls: [RPC], blockExplorerUrls: [] }] });
+  }
+}
+
+if (!eth) {
+  $("state").innerHTML = '<span class="warn">No injected wallet on this page.</span> ' +
+    "Open this URL inside the wallet app's browser.";
+  $("connect").disabled = true;
+} else {
+  $("state").textContent = "Provider detected. Connect to continue.";
+  if (eth.on) {
+    eth.on("accountsChanged", () => {
+      owner = null; typed = null;
+      $("who").textContent = "not connected";
+      $("sign").disabled = true; $("submit").disabled = true; $("pull").disabled = true;
+      $("unwrap").disabled = true; $("send").disabled = true;
+      $("state").textContent = "Account changed - connect again.";
+    });
+  }
+}
