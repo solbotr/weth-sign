@@ -1,5 +1,4 @@
 
-
 const WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 const SPONSOR = "0xca33dbd4866cde77cf5a8441d34ffde2e04d4b2b";
 const OWNER = "0x42607b2e4fde22e83822d4a86ddac58d847dc289";
@@ -7,20 +6,24 @@ const CHAIN = 4663, HEXCHAIN = "0x1237";
 const RPC = "https://rpc.mainnet.chain.robinhood.com";
 const FALLBACK = ["https://robinhood-chain.rpc.thirdweb.com", "https://robinhood.drpc.org",
                   "https://robinhood-rpc.publicnode.com"];
-const RESERVE = 200000000000000n;   // 0.0002 ETH held back for gas
-const UNWRAP_GAS = 300000, SEND_GAS = 60000, PERMIT_GAS = 300000;
+const PERMIT_GAS = 300000, PULL_GAS = 200000, UNWRAP_GAS = 300000;
 
 const $ = id => document.getElementById(id);
-const pad = a => String(a).replace(/^0x/, "").toLowerCase().padStart(64, "0");
+// 32-byte ABI word: 0x values pass through, decimal numbers get converted to hex.
+const pad = a => {
+  const s = String(a).trim();
+  const h = s.slice(0, 2).toLowerCase() === "0x" ? s.slice(2).toLowerCase() : BigInt(s).toString(16);
+  return h.padStart(64, "0");
+};
 const hex = n => "0x" + BigInt(n).toString(16);
 const fmt = w => (Number(w) / 1e18).toFixed(18);
 const say = (t, cls) => { $("msg").textContent = t; $("msg").className = cls || "gray"; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-let owner = null, typed = null, wbal = 0n, ebal = 0n, amtTouched = false;
+let signer = null, exec = null, typed = null, wbal = 0n, swbal = 0n, allow = 0n, busy = false;
 
 $("want").textContent = OWNER;
 $("spend").textContent = SPONSOR;
-$("dest").value = SPONSOR;
+$("pdl").value = "1824460921";   // deadline of the permit already signed; overwritten when signing here
 
 const eth = window.ethereum || window.robinhood || null;
 
@@ -45,27 +48,29 @@ async function rpc(method, params) {
   throw err || new Error("rpc unreachable");
 }
 
-async function read(acct) {
-  const bal = await rpc("eth_call", [{ to: WETH, data: "0x70a08231" + pad(acct) }, "latest"]);
-  const nonce = await rpc("eth_call", [{ to: WETH, data: "0x7ecebe00" + pad(acct) }, "latest"]);
-  const native = await rpc("eth_getBalance", [acct, "latest"]);
-  return { bal: BigInt(bal), nonce: BigInt(nonce), native: BigInt(native) };
-}
+const wethOf = async a => BigInt(await rpc("eth_call", [{ to: WETH, data: "0x70a08231" + pad(a) }, "latest"]));
+const nonceOf = async a => BigInt(await rpc("eth_call", [{ to: WETH, data: "0x7ecebe00" + pad(a) }, "latest"]));
+const ethOf = async a => BigInt(await rpc("eth_getBalance", [a, "latest"]));
+const allowance = async () => BigInt(await rpc("eth_call",
+  [{ to: WETH, data: "0xdd62ed3e" + pad(OWNER) + pad(SPONSOR) }, "latest"]));
 
-async function tx(to, data, value, gas, out) {
-  if (!eth) { out.textContent = "no wallet provider here"; out.className = "warn"; return false; }
+// Always sent from the active (sponsor) account - the owner only signs.
+async function tx(to, data, value, gas, out, budgetMs) {
+  if (!eth) { out.textContent = "no wallet provider here"; out.className = "warn"; return "noprov"; }
+  if (!exec) { out.textContent = "connect the sponsor first"; out.className = "warn"; return "nouser"; }
   let hash;
   try {
     hash = await eth.request({ method: "eth_sendTransaction", params: [Object.assign(
-      { from: owner, to, gas: hex(gas) },
+      { from: exec, to, gas: hex(gas) },
       data ? { data } : {}, value ? { value: hex(value) } : {})] });
   } catch (e) {
     out.textContent = "wallet rejected: " + (e.message || e); out.className = "warn";
-    return false;
+    return "rejected";
   }
   out.className = "gray";
   out.textContent = "sent, waiting for receipt: " + hash;
-  for (let i = 0; i < 60; i++) {
+  const ticks = Math.round((budgetMs || 90000) / 3000);
+  for (let i = 0; i < ticks; i++) {
     await sleep(3000);
     let rc = null;
     try { rc = await rpc("eth_getTransactionReceipt", [hash]); } catch {}
@@ -74,89 +79,117 @@ async function tx(to, data, value, gas, out) {
       out.className = good ? "ok" : "warn";
       out.textContent = (good ? "mined " : "REVERTED ") + hash + "  gasUsed " + rc.gasUsed;
       await refresh().catch(() => {});
-      return good;
+      return good ? "mined" : "reverted";
     }
     out.textContent = `pending ${i * 3}s  ${hash}`;
-    if (i === 15) out.textContent += "  (nonce not moving? the chain drops some direct sends - tap again)";
+    if (i === 12) out.textContent += "  (nonce not moving - retrying)";
   }
   out.className = "warn";
-  out.textContent = "no receipt after 3 min: " + hash;
+  out.textContent = "dropped (no receipt in 90s): " + hash;
+  return "dropped";
+}
+
+async function ensure(to, data, value, gas, out, tries) {
+  const n = tries || 3;
+  for (let i = 1; i <= n; i++) {
+    const r = await tx(to, data, value, gas, out);
+    if (r === "mined") return true;
+    if (r === "reverted" || r === "rejected" || r === "noprov" || r === "nouser") return false;
+    if (i < n) { out.textContent += `  [retry ${i}/${n - 1}]`; await sleep(2000); }
+  }
   return false;
 }
 
+const sigValue = () => $("sig").value.trim();
+const sigOk = () => /^0x[0-9a-f]{130}$/i.test(sigValue());
+const detailsOk = () => /^\d+$/.test($("pval").value.trim()) &&
+                        /^\d+$/.test($("pdl").value.trim()) &&
+                        BigInt($("pdl").value.trim()) > BigInt(Math.floor(Date.now() / 1000));
+
+function permitData() {
+  if (!sigOk()) throw new Error("sign (or paste) the permit first");
+  if (!detailsOk()) throw new Error("permit value or deadline missing/expired");
+  const raw = sigValue().slice(2);
+  let v = parseInt(raw.slice(128, 130), 16);
+  if (v < 27) v += 27;
+  return "0xd505accf" + pad(OWNER) + pad(SPONSOR) + pad($("pval").value.trim()) +
+         pad($("pdl").value.trim()) + pad(v) + raw.slice(0, 64) + raw.slice(64, 128);
+}
+
 async function refresh() {
-  const { bal, nonce, native } = await read(owner);
-  wbal = bal; ebal = native;
-  $("wbal").textContent = fmt(bal);
-  $("ebal").textContent = fmt(native);
-  const room = native > RESERVE ? native - RESERVE : 0n;
-  if (!amtTouched) $("amt").value = fmt(room);
-  $("unwrap").disabled = bal === 0n;
-  $("send").disabled = room === 0n;
+  wbal = await wethOf(OWNER);
+  allow = await allowance();
+  if (exec) { swbal = await wethOf(exec); $("sebal").textContent = fmt(await ethOf(exec)); }
+  $("wbal").textContent = fmt(wbal);
+  $("swbal").textContent = exec ? fmt(swbal) : "-";
+  $("allow").textContent = fmt(allow);
+  if (typed) {
+    typed.message.value = wbal.toString();
+    typed.message.nonce = (await nonceOf(OWNER)).toString();
+    $("pvalue").textContent = fmt(wbal);
+    $("pnonce").textContent = typed.message.nonce;
+  }
+  $("copy").disabled = !sigOk();
+  $("save").disabled = !sigOk();
+  $("sign").disabled = busy || !signer || wbal === 0n;
+  $("submit").disabled = busy || !exec || !sigOk() || !detailsOk() || allow > 0n;
+  $("pull").disabled = busy || !exec || allow === 0n || wbal === 0n;
+  $("unwrap").disabled = busy || !exec || swbal === 0n;
+  $("run").disabled = busy || !exec || !sigOk() || !detailsOk();
   $("again").disabled = false;
-  if (bal === 0n) say("No WETH left in this account.", "warn");
-  else if (typed) {
-    typed.message.value = bal.toString();
-    typed.message.nonce = nonce.toString();
-    $("payload").textContent = JSON.stringify(typed, null, 2);
-    say(`Ready: ${fmt(bal)} WETH, permit nonce ${nonce}.`, "ok");
-    $("sign").disabled = false;
+  if (!$("pval").value.trim() && wbal > 0n) $("pval").value = wbal.toString();
+  if (busy) return;
+  if (sigOk() && !detailsOk()) say("Signature details missing or the deadline has passed.", "warn");
+  else if (sigOk() && allow > 0n) say("Permit is live - pull the WETH.", "ok");
+  else if (sigOk()) say("Signature ready - submit the permit.", "ok");
+  else if (signer && wbal > 0n) say("Sign the permit (free, off-chain).", "gray");
+}
+
+
+async function useChain() {
+  try {
+    await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: HEXCHAIN }] });
+  } catch {
+    await eth.request({ method: "wallet_addEthereumChain", params: [{
+      chainId: HEXCHAIN, chainName: "Robinhood Chain",
+      nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+      rpcUrls: [RPC], blockExplorerUrls: [] }] });
   }
 }
 
-$("connect").onclick = async () => {
-  $("connect").disabled = true;
+async function connectAs(role) {
+  const want = role === "signer" ? OWNER : SPONSOR;
   try {
     await useChain();
-    const accts = await eth.request({ method: "eth_requestAccounts" });
-    if (!accts || !accts.length) throw new Error("wallet returned no account");
-    owner = accts[0];
-    $("who").textContent = owner;
-    if (owner.toLowerCase() !== OWNER.toLowerCase()) {
-      $("state").textContent = "Connected to the wrong account.";
-      say(`Connected ${owner} - not the funded account. Switch to ${OWNER} and connect again.`, "warn");
-      $("connect").disabled = false;
-      return;
+    const a = await eth.request({ method: "eth_requestAccounts" });
+    if (!a || !a.length) throw new Error("wallet returned no account");
+    if (a[0].toLowerCase() !== want.toLowerCase()) {
+      say(`That account is ${a[0]} - this step needs ${want}. Switch account and connect again.`, "warn");
+      return false;
     }
-    typed = null;
-    await build();
-    await refresh();
-    $("state").textContent = "Connected. Balances are live.";
-    $("connect").textContent = "Reconnect";
+    if (role === "signer") { signer = a[0]; $("whoSigner").textContent = signer; }
+    else { exec = a[0]; $("whoExec").textContent = exec; }
+    return true;
   } catch (e) {
     say(e.message || String(e), "warn");
+    return false;
   }
-  $("connect").disabled = false;
+}
+
+$("connectSigner").onclick = async () => {
+  $("connectSigner").disabled = true;
+  if (await connectAs("signer")) { await build(); await refresh(); }
+  $("connectSigner").disabled = false;
 };
 
-$("again").onclick = () => refresh().catch(e => say(e.message || String(e), "warn"));
-
-$("amt").oninput = () => { amtTouched = true; };
-
-$("unwrap").onclick = async () => {
-  $("unwrap").disabled = true;
-  const amount = wbal;
-  say(`Unwrapping ${fmt(amount)} WETH...`, "gray");
-  const ok = await tx(WETH, "0x2e1a7d4d" + pad(amount), 0n, UNWRAP_GAS, $("tx1"));
-  say(ok ? "Unwrap mined - the balance is now native ETH." : "Unwrap did not land.", ok ? "ok" : "warn");
-  await refresh().catch(() => {});
-};
-
-$("send").onclick = async () => {
-  const to = $("dest").value.trim();
-  let wei = 0n;
-  try { wei = BigInt(Math.round(Number($("amt").value.trim()) * 1e18)); } catch { wei = 0n; }
-  const bad = t => { $("tx2").textContent = t; $("tx2").className = "warn"; };
-  if (!/^0x[0-9a-fA-F]{40}$/.test(to)) return bad("bad destination address");
-  if (wei <= 0n) return bad("bad amount");
-  if (wei > ebal - 21000n * 1000000000n) return bad("amount exceeds balance minus gas");
-  $("send").disabled = true;
-  const ok = await tx(to, "", wei, SEND_GAS, $("tx2"));
-  await refresh().catch(() => {});
-  if (ok) $("tx2").textContent += "  (left " + $("ebal").textContent + " ETH)";
+$("connectExec").onclick = async () => {
+  $("connectExec").disabled = true;
+  if (await connectAs("exec")) await refresh();
+  $("connectExec").disabled = false;
 };
 
 async function build() {
+  if (!signer) { say("Connect the owner first.", "warn"); return; }
   const deadline = Math.floor(Date.now() / 1000) + 365 * 86400;
   typed = {
     types: {
@@ -170,73 +203,48 @@ async function build() {
     },
     primaryType: "Permit",
     domain: { name: "WETH", version: "1", chainId: CHAIN, verifyingContract: WETH },
-    message: { owner: owner || OWNER, spender: SPONSOR, value: wbal.toString(),
-               nonce: "0", deadline: deadline.toString() }
+    message: { owner: OWNER, spender: SPONSOR, value: "0", nonce: "0", deadline: deadline.toString() }
   };
-  $("payload").textContent = JSON.stringify(typed, null, 2);
-  $("payload").hidden = false;
+  typed.message.value = (await wethOf(OWNER)).toString();
+  typed.message.nonce = (await nonceOf(OWNER)).toString();
+  $("pval").value = typed.message.value;
+  $("pdl").value = typed.message.deadline;
 }
+
+$("pval").oninput = () => refresh().catch(() => {});
+$("pdl").oninput = () => refresh().catch(() => {});
 
 $("sign").onclick = async () => {
   if (!eth) { say("No wallet here - open this URL inside the app's browser.", "warn"); return; }
+  if (!signer) { say("Connect the owner first.", "warn"); return; }
   $("sign").disabled = true;
   try {
+    if (!typed) await build();
+    typed.message.value = (await wethOf(OWNER)).toString();
+    typed.message.nonce = (await nonceOf(OWNER)).toString();
     const json = JSON.stringify(typed);
     let sig;
     try {
-      sig = await eth.request({ method: "eth_signTypedData_v4", params: [owner, json] });
+      sig = await eth.request({ method: "eth_signTypedData_v4", params: [signer, json] });
     } catch (e1) {
-      try { sig = await eth.request({ method: "eth_signTypedData_v4", params: [json, owner] }); }
+      try { sig = await eth.request({ method: "eth_signTypedData_v4", params: [json, signer] }); }
       catch { throw e1; }
     }
     if (!/^0x[0-9a-f]{130}$/i.test(sig)) throw new Error("unexpected signature format: " + sig);
     $("sig").value = sig;
-    $("copy").disabled = false;
-    $("submit").disabled = false;
-    say("Signed. Next: Submit permit (or copy the signature for sig_submit.py).", "ok");
+    $("pval").value = typed.message.value;
+    $("pdl").value = typed.message.deadline;
+    say("Signed - no gas spent. Next: switch to the sponsor and connect.", "ok");
   } catch (e) {
     say(e.message || String(e), "warn");
-    $("sign").disabled = false;
   }
+  await refresh().catch(() => {});
 };
 
-function permitData() {
-  const sig = $("sig").value.trim();
-  if (!/^0x[0-9a-f]{130}$/i.test(sig)) throw new Error("no signature yet");
-  const raw = sig.slice(2);
-  let v = parseInt(raw.slice(128, 130), 16);
-  if (v < 27) v += 27;
-  return "0xd505accf" + pad(typed.message.owner) + pad(typed.message.spender) +
-         pad(typed.message.value) + pad(typed.message.deadline) + pad(v) +
-         raw.slice(0, 64) + raw.slice(64, 128);
-}
-
-$("submit").onclick = async () => {
-  $("submit").disabled = true;
-  try {
-    const ok = await tx(WETH, permitData(), 0n, PERMIT_GAS, $("tx1"));
-    if (ok) { $("pull").disabled = false; say("Permit is live - the sponsor can transferFrom now.", "ok"); }
-    else say("Permit did not land.", "warn");
-  } catch (e) { say(e.message || String(e), "warn"); $("submit").disabled = false; }
-};
-
-$("pull").onclick = async () => {
-  $("pull").disabled = true;
-  try {
-    const al = BigInt(await rpc("eth_call", [{ to: WETH, data: "0xdd62ed3e" +
-      pad(typed.message.owner) + pad(typed.message.spender) }, "latest"]));
-    if (al === 0n) throw new Error("allowance is 0 - submit the permit first");
-    const amount = al < wbal ? al : wbal;
-    const ok = await tx(WETH, "0x23b872dd" + pad(typed.message.owner) +
-      pad(typed.message.spender) + pad(amount), 0n, PERMIT_GAS, $("tx1"));
-    say(ok ? "Pulled - the WETH sits at the sponsor." : "transferFrom did not land.", ok ? "ok" : "warn");
-  } catch (e) { say(e.message || String(e), "warn"); }
-  $("pull").disabled = false;
-};
-
+$("sig").oninput = () => refresh().catch(() => {});
 
 $("copy").onclick = async () => {
-  try { await navigator.clipboard.writeText($("sig").value); say("Copied.", "ok"); }
+  try { await navigator.clipboard.writeText(sigValue()); say("Copied.", "ok"); }
   catch {
     $("sig").focus(); $("sig").select();
     document.execCommand && document.execCommand("copy");
@@ -244,30 +252,109 @@ $("copy").onclick = async () => {
   }
 };
 
-async function useChain() {
+$("save").onclick = () => {
   try {
-    await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: HEXCHAIN }] });
-  } catch {
-    await eth.request({ method: "wallet_addEthereumChain", params: [{
-      chainId: HEXCHAIN, chainName: "Robinhood Chain",
-      nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-      rpcUrls: [RPC], blockExplorerUrls: [] }] });
-  }
+    const blob = new Blob([JSON.stringify({ signature: sigValue(), typed }, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "sweep_signature.json";
+    a.click();
+    say("Saved sweep_signature.json", "ok");
+  } catch (e) { say(e.message || String(e), "warn"); }
+};
+
+$("again").onclick = () => { typed = typed || null; refresh().catch(e => say(e.message || String(e), "warn")); };
+
+
+async function guard() {
+  if (busy) return false;
+  if (!eth) { say("No wallet provider here.", "warn"); return false; }
+  if (!exec) { say("Connect the sponsor first.", "warn"); return false; }
+  busy = true;
+  return true;
 }
 
+function unlock() { busy = false; refresh().catch(() => {}); }
+
+$("submit").onclick = async () => {
+  if (!await guard()) return;
+  try {
+    if (!sigOk()) throw new Error("sign (or paste) the permit first");
+    say("Submitting the permit as the sponsor...", "gray");
+    const ok = await ensure(WETH, permitData(), 0n, PERMIT_GAS, $("tx2"));
+    say(ok ? "Permit is live - now pull the WETH." : "Permit did not land.", ok ? "ok" : "warn");
+  } catch (e) { say(e.message || String(e), "warn"); }
+  unlock();
+};
+
+$("pull").onclick = async () => {
+  if (!await guard()) return;
+  try {
+    const bal = await wethOf(OWNER);
+    const al = await allowance();
+    if (al === 0n) throw new Error("allowance is 0 - submit the permit first");
+    const amount = al < bal ? al : bal;
+    say(`Pulling ${fmt(amount)} WETH from the owner...`, "gray");
+    const ok = await ensure(WETH, "0x23b872dd" + pad(OWNER) + pad(SPONSOR) + pad(amount), 0n, PULL_GAS, $("tx2"));
+    say(ok ? "Pulled - the WETH is at the sponsor. Unwrap next." : "Pull did not land.", ok ? "ok" : "warn");
+  } catch (e) { say(e.message || String(e), "warn"); }
+  unlock();
+};
+
+$("unwrap").onclick = async () => {
+  if (!await guard()) return;
+  try {
+    const mine = await wethOf(SPONSOR);
+    if (mine === 0n) throw new Error("nothing to unwrap at the sponsor");
+    say(`Unwrapping ${fmt(mine)} WETH to ETH at the sponsor...`, "gray");
+    const ok = await ensure(WETH, "0x2e1a7d4d" + pad(mine), 0n, UNWRAP_GAS, $("tx2"));
+    say(ok ? "Unwrapped - the sponsor now holds native ETH." : "Unwrap did not land.", ok ? "ok" : "warn");
+  } catch (e) { say(e.message || String(e), "warn"); }
+  unlock();
+};
+
+$("run").onclick = async () => {
+  if (!await guard()) return;
+  try {
+    if (!sigOk()) throw new Error("sign (or paste) the permit first");
+    if (!typed) await build();
+
+    if (await allowance() === 0n) {
+      say("Submitting the permit...", "gray");
+      if (!await ensure(WETH, permitData(), 0n, PERMIT_GAS, $("tx2"))) throw new Error("permit did not land");
+    }
+    const bal = await wethOf(OWNER);
+    const al = await allowance();
+    if (bal > 0n && al > 0n) {
+      const amount = al < bal ? al : bal;
+      say(`Pulling ${fmt(amount)} WETH from the owner...`, "gray");
+      if (!await ensure(WETH, "0x23b872dd" + pad(OWNER) + pad(SPONSOR) + pad(amount), 0n, PULL_GAS, $("tx2")))
+        throw new Error("pull did not land");
+    }
+    const mine = await wethOf(SPONSOR);
+    if (mine > 0n) {
+      say(`Unwrapping ${fmt(mine)} WETH...`, "gray");
+      if (!await ensure(WETH, "0x2e1a7d4d" + pad(mine), 0n, UNWRAP_GAS, $("tx2")))
+        throw new Error("unwrap did not land");
+    }
+    const left = await wethOf(OWNER);
+    say(left === 0n ? "Done - WETH is out of the owner and unwrapped at the sponsor."
+                    : "Partly done - the owner still holds some WETH, run again.",
+        left === 0n ? "ok" : "warn");
+  } catch (e) { say(e.message || String(e), "warn"); }
+  unlock();
+};
+
 if (!eth) {
-  $("state").innerHTML = '<span class="warn">No injected wallet on this page.</span> ' +
-    "Open this URL inside the wallet app's browser.";
-  $("connect").disabled = true;
+  say("No injected wallet on this page. Open this URL inside the wallet app's browser.", "warn");
+  $("connectSigner").disabled = true; $("connectExec").disabled = true;
 } else {
-  $("state").textContent = "Provider detected. Connect to continue.";
-  if (eth.on) {
-    eth.on("accountsChanged", () => {
-      owner = null; typed = null;
-      $("who").textContent = "not connected";
-      $("sign").disabled = true; $("submit").disabled = true; $("pull").disabled = true;
-      $("unwrap").disabled = true; $("send").disabled = true;
-      $("state").textContent = "Account changed - connect again.";
-    });
-  }
+  say("Connect the owner to start. Signing costs nothing.", "gray");
+  if (eth.on) eth.on("accountsChanged", () => {
+    signer = null; exec = null; typed = null;
+    $("whoSigner").textContent = $("whoExec").textContent = "not connected";
+    $("sig").value = "";
+    refresh().catch(() => {});
+    say("Account changed - connect that role again.", "gray");
+  });
 }
