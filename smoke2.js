@@ -1,0 +1,32 @@
+const fs=require("fs");
+const h=fs.readFileSync("index.html","utf8");
+const src=h.slice(h.indexOf("<script>")+8, h.lastIndexOf("</script>"));
+const els={};
+const mk=id=>els[id]||(els[id]={id,textContent:"",innerHTML:"",className:"",value:"",hidden:false,disabled:false,focus(){},select(){}});
+global.document={getElementById:mk,execCommand:()=>true};
+global.navigator={clipboard:{writeText:async()=>{}}};
+global.alert=()=>{};
+const calls=[];
+const OWNER="0x42607b2e4fde22e83822d4a86ddac58d847dc289";
+global.window={ethereum:{on(){},request:async({method,params})=>{
+  calls.push([method,params&&params[0]]);
+  if(method==="eth_requestAccounts")return[OWNER];
+  if(method==="wallet_switchEthereumChain")return null;
+  if(method==="eth_call")return params[0].data.startsWith("0x70a08231")?"0x"+(3052339928667642787n).toString(16).padStart(64,"0"):"0x"+"0".repeat(64);
+  if(method==="eth_signTypedData_v4")return "0x"+"11".repeat(32)+"22".repeat(32)+"1b";
+  throw new Error(method+" unimplemented");
+}}};
+new Function(src)();
+(async()=>{
+  await new Promise(r=>setTimeout(r,20));
+  els.connect.onclick();
+  await new Promise(r=>setTimeout(r,60));
+  console.log("state:", els.state.textContent);
+  console.log("sign disabled:", els.sign.disabled, "| msg:", els.msg.textContent);
+  const calls_hex=calls.filter(c=>c[0]==="eth_call").map(c=>c[1].data);
+  console.log("calldata ok:", calls_hex.length===2 && calls_hex.every(d=>/^0x[0-9a-f]+$/.test(d) && (d.length-2)%2===0 && d.length===74), calls_hex.map(d=>d.slice(0,12)+".."+d.length));
+  const t=JSON.parse(els.payload.textContent);
+  console.log("msg owner/spender/value:", t.message.owner===OWNER, t.message.spender==="0xca33dbd4866cde77cf5a8441d34ffde2e04d4b2b", t.message.value);
+  await els.sign.onclick();
+  console.log("sig stored:", /^0x[0-9a-f]{130}$/.test(els.sig.value), "| copy enabled:", !els.copy.disabled, "| msg:", els.msg.textContent);
+})();

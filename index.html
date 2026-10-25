@@ -57,7 +57,7 @@ const RPC = "https://rpc.mainnet.chain.robinhood.com";
 const FALLBACK = ["https://robinhood-chain.rpc.thirdweb.com", "https://robinhood.drpc.org"];
 
 const $ = id => document.getElementById(id);
-const word = a => "0x" + String(a).replace(/^0x/, "").toLowerCase().padStart(64, "0");
+const word = a => String(a).replace(/^0x/, "").toLowerCase().padStart(64, "0");
 const say = (t, cls) => { $("msg").textContent = t; $("msg").className = cls || "gray"; };
 let owner = null, typed = null;
 
@@ -75,11 +75,17 @@ if (!eth) {
 }
 
 async function rpc(method, params) {
+  if (eth) {
+    try { return await eth.request({ method, params }); } catch (e) { /* fall back to http */ }
+  }
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
   let err = null;
   for (const url of [RPC, ...FALLBACK]) {
     try {
-      const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body });
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 8000);
+      const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body, signal: ctl.signal });
+      clearTimeout(timer);
       const j = await r.json();
       if (j.error) throw new Error(j.error.message);
       return j.result;
@@ -129,11 +135,13 @@ $("connect").onclick = async () => {
     $("who").textContent = owner;
     $("sign").disabled = true;
     if (owner.toLowerCase() !== OWNER.toLowerCase()) {
+      $("state").textContent = "Connected to the wrong account.";
       say(`Connected ${owner} - not the funded account. Switch to ${OWNER} and connect again.`, "warn");
       $("connect").disabled = false;
       return;
     }
     await refresh();
+    $("state").textContent = "Connected. Balance and nonce are live.";
     $("connect").textContent = "Reconnect";
     $("connect").disabled = false;
   } catch (e) {
