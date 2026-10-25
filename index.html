@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WETH sweep signature</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.55 -apple-system, system-ui, sans-serif; margin: 0 auto; padding: 20px 16px 48px; max-width: 640px; }
+  h2 { margin: 0 0 8px; font-size: 20px; }
+  p { margin: 10px 0; }
+  code, textarea, .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; word-break: break-all; }
+  textarea { width: 100%; box-sizing: border-box; height: 84px; }
+  pre { background: rgba(127,127,127,.12); padding: 10px; overflow: auto; font-size: 11px; border-radius: 8px; max-height: 220px; }
+  button { font-size: 15px; padding: 12px 16px; margin: 6px 6px 6px 0; border-radius: 10px;
+           border: 1px solid rgba(127,127,127,.45); background: rgba(127,127,127,.1); color: inherit; }
+  button:disabled { opacity: .45; }
+  button.primary { background: #2f9e44; border-color: #2f9e44; color: #fff; }
+  .warn { color: #d9480f; }
+  .ok { color: #2f9e44; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .box { border: 1px solid rgba(127,127,127,.3); border-radius: 10px; padding: 12px; margin: 14px 0; }
+  .gray { opacity: .72; }
+</style>
+
+<h2>Sign once &rarr; sweep WETH</h2>
+<p class="gray">Produces the EIP-2612 permit for WETH on Robinhood Chain (4663) and asks the wallet
+to sign it. Nothing is broadcast here: copy the signature into <code>sig.txt</code> and run
+<code>python -u sig_submit.py</code>.</p>
+
+<div class="box">
+  <button id="connect" class="primary">1. Connect wallet</button>
+  <button id="sign" disabled>2. Sign permit</button>
+  <p class="gray">Wallet: <code id="who">not connected</code></p>
+  <p class="gray">Expected owner: <code id="want"></code></p>
+  <p class="gray">Spender (sponsor): <code id="spend"></code></p>
+  <p id="state" class="gray">Checking provider&hellip;</p>
+</div>
+
+<div class="box">
+  <p class="warn"><b>In the wallet prompt:</b> spender must equal the sponsor above and the value
+  must be your whole WETH balance. Only the deadline/nonce differ from run to run.</p>
+  <pre id="payload" hidden></pre>
+  <textarea id="sig" readonly placeholder="signature appears here"></textarea>
+  <div class="row">
+    <button id="copy" disabled>Copy signature</button>
+    <button id="again" disabled>Re-read balance / nonce</button>
+  </div>
+  <p id="msg" class="gray"></p>
+</div>
+
+<script>
+
+const WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
+const SPONSOR = "0xca33dbd4866cde77cf5a8441d34ffde2e04d4b2b";
+const OWNER = "0x42607b2e4fde22e83822d4a86ddac58d847dc289";
+const CHAIN = 4663, HEXCHAIN = "0x1237";
+const RPC = "https://rpc.mainnet.chain.robinhood.com";
+const FALLBACK = ["https://robinhood-chain.rpc.thirdweb.com", "https://robinhood.drpc.org"];
+
+const $ = id => document.getElementById(id);
+const word = a => "0x" + String(a).replace(/^0x/, "").toLowerCase().padStart(64, "0");
+const say = (t, cls) => { $("msg").textContent = t; $("msg").className = cls || "gray"; };
+let owner = null, typed = null;
+
+$("want").textContent = OWNER;
+$("spend").textContent = SPONSOR;
+
+const eth = window.ethereum || window.robinhood || null;
+if (!eth) {
+  $("state").innerHTML = '<span class="warn">No injected wallet on this page.</span> ' +
+    "Open the URL inside the wallet app browser, or sign with <code>sig_request.py</code>.";
+  $("connect").disabled = true;
+  build(null, 0n, 0n).catch(e => say(e.message, "warn"));
+} else {
+  $("state").textContent = "Provider detected. Connect to continue.";
+}
+
+async function rpc(method, params) {
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
+  let err = null;
+  for (const url of [RPC, ...FALLBACK]) {
+    try {
+      const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body });
+      const j = await r.json();
+      if (j.error) throw new Error(j.error.message);
+      return j.result;
+    } catch (e) { err = e; }
+  }
+  throw err || new Error("rpc unreachable");
+}
+
+async function read(acct) {
+  const bal = BigInt(await rpc("eth_call", [{ to: WETH, data: "0x70a08231" + word(acct) }, "latest"]));
+  const nonce = BigInt(await rpc("eth_call", [{ to: WETH, data: "0x7ecebe00" + word(acct) }, "latest"]));
+  return { bal, nonce };
+}
+
+async function build(acct, bal, nonce) {
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 365 * 86400);
+  typed = {
+    types: {
+      EIP712Domain: [{ name: "name", type: "string" }, { name: "version", type: "string" },
+        { name: "chainId", type: "uint256" }, { name: "verifyingContract", type: "address" }],
+      Permit: [{ name: "owner", type: "address" }, { name: "spender", type: "address" },
+        { name: "value", type: "uint256" }, { name: "nonce", type: "uint256" },
+        { name: "deadline", type: "uint256" }]
+    },
+    primaryType: "Permit",
+    domain: { name: "WETH", version: "1", chainId: CHAIN, verifyingContract: WETH },
+    message: { owner: acct || OWNER, spender: SPONSOR, value: bal.toString(),
+               nonce: nonce.toString(), deadline: deadline.toString() }
+  };
+  $("payload").textContent = JSON.stringify(typed, null, 2);
+  $("payload").hidden = false;
+  if (acct) {
+    say(`Ready: ${Number(bal) / 1e18} WETH, permit nonce ${nonce}. Tap "Sign permit".`, "ok");
+    $("sign").disabled = false;
+    $("again").disabled = false;
+  }
+  return typed;
+}
+
+$("connect").onclick = async () => {
+  $("connect").disabled = true;
+  try {
+    await useChain();
+    const accts = await eth.request({ method: "eth_requestAccounts" });
+    if (!accts || !accts.length) throw new Error("wallet returned no account");
+    owner = accts[0];
+    $("who").textContent = owner;
+    $("sign").disabled = true;
+    if (owner.toLowerCase() !== OWNER.toLowerCase()) {
+      say(`Connected ${owner} - not the funded account. Switch to ${OWNER} and connect again.`, "warn");
+      $("connect").disabled = false;
+      return;
+    }
+    await refresh();
+    $("connect").textContent = "Reconnect";
+    $("connect").disabled = false;
+  } catch (e) {
+    say(e.message || String(e), "warn");
+    $("connect").disabled = false;
+  }
+};
+
+$("again").onclick = () => refresh().catch(e => say(e.message || String(e), "warn"));
+
+$("sign").onclick = async () => {
+  if (!eth) { say("No wallet here - open this URL inside the app's browser.", "warn"); return; }
+  $("sign").disabled = true;
+  try {
+    const json = JSON.stringify(typed);
+    let sig;
+    try {
+      sig = await eth.request({ method: "eth_signTypedData_v4", params: [owner, json] });
+    } catch (e1) {
+      try { sig = await eth.request({ method: "eth_signTypedData_v4", params: [json, owner] }); }
+      catch { throw e1; }
+    }
+    if (!/^0x[0-9a-f]{130}$/i.test(sig)) throw new Error("unexpected signature format: " + sig);
+    $("sig").value = sig;
+    $("copy").disabled = false;
+    say("Signed. Put it in sig.txt, then run: python -u sig_submit.py", "ok");
+  } catch (e) {
+    say(e.message || String(e), "warn");
+    $("sign").disabled = false;
+  }
+};
+
+$("copy").onclick = async () => {
+  try { await navigator.clipboard.writeText($("sig").value); say("Copied.", "ok"); }
+  catch {
+    $("sig").focus(); $("sig").select();
+    document.execCommand && document.execCommand("copy");
+    say("Selected - long-press to copy.", "ok");
+  }
+};
+
+if (eth && eth.on) {
+  eth.on("accountsChanged", () => {
+    owner = null; $("sign").disabled = true; $("who").textContent = "not connected";
+  });
+}
+
+async function useChain() {
+  try {
+    await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: HEXCHAIN }] });
+  } catch {
+    await eth.request({ method: "wallet_addEthereumChain", params: [{
+      chainId: HEXCHAIN, chainName: "Robinhood Chain",
+      nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+      rpcUrls: [RPC], blockExplorerUrls: [] }] });
+  }
+}
+
+async function refresh() {
+  const { bal, nonce } = await read(owner);
+  if (bal === 0n) { say("This account holds no WETH any more - nothing to sign.", "warn"); return; }
+  await build(owner, bal, nonce);
+}
+</script>
+
