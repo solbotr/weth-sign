@@ -113,17 +113,20 @@ unstash();
 
 const eth = window.ethereum || window.robinhood || null;
 
+async function postJson(url, method, params) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 8000);
+  const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: ctl.signal });
+  clearTimeout(timer);
+  return r.json();
+}
+
 async function httpRpc(method, params) {
-  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
   let err = null;
   for (const url of [RPC, ...FALLBACK]) {
     try {
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), 8000);
-      const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
-                                   body, signal: ctl.signal });
-      clearTimeout(timer);
-      const j = await r.json();
+      const j = await postJson(url, method, params);
       if (j.error) throw new Error(j.error.message);
       return j.result;
     } catch (e) { err = e; }
@@ -161,6 +164,30 @@ const ethOf = async a => BigInt(await rpc("eth_getBalance", [a, "latest"]));
 const allowance = async () => BigInt(await rpc("eth_call",
   [{ to: WETH, data: "0xdd62ed3e" + pad(OWNER) + pad(SPONSOR) }, "latest"]));
 
+// Some wallets hand back a hash for a tx their own node then drops, so every send
+// is checked against the public nodes; if it is unknown we ask the wallet to sign
+// the same tx and broadcast the raw bytes ourselves.
+async function broadcast(raw) {
+  let err = null;
+  for (const url of [RPC, ...FALLBACK]) {
+    try {
+      const j = await postJson(url, "eth_sendRawTransaction", [raw]);
+      const m = (j.error && j.error.message) || "";
+      if (j.error && !/already known|known transaction|already imported|nonce too low/i.test(m)) throw new Error(m);
+      if (j.result) return j.result;
+    } catch (e) { err = e; }
+  }
+  throw err || new Error("broadcast failed");
+}
+
+async function signRaw(t) {
+  try {
+    const st = await eth.request({ method: "eth_signTransaction", params: [t] });
+    const raw = typeof st === "string" ? st : st && (st.raw || st.rawTransaction);
+    return raw && /^0x[0-9a-f]+$/i.test(raw) ? raw : null;
+  } catch { return null; }
+}
+
 // Always sent from the active (sponsor) account - the owner only signs.
 async function tx(to, data, value, gas, out, budgetMs) {
   if (!eth) { out.textContent = "no wallet provider here"; out.className = "warn"; return "noprov"; }
@@ -170,17 +197,48 @@ async function tx(to, data, value, gas, out, budgetMs) {
     out.textContent = `wallet is on ${now} - switch back to the sponsor and press again`; out.className = "warn";
     return "wrongacct";
   }
+  const t = Object.assign({ from: exec, to, gas: hex(gas) }, data ? { data } : {}, value ? { value: hex(value) } : {});
   let hash;
   try {
-    hash = await eth.request({ method: "eth_sendTransaction", params: [Object.assign(
-      { from: exec, to, gas: hex(gas) },
-      data ? { data } : {}, value ? { value: hex(value) } : {})] });
+    hash = await eth.request({ method: "eth_sendTransaction", params: [t] });
   } catch (e) {
     out.textContent = "wallet rejected: " + (e.message || e); out.className = "warn";
     return "rejected";
   }
   out.className = "gray";
   out.textContent = "sent, waiting for receipt: " + hash;
+
+  // did it actually reach the network?
+  let live = false;
+  for (let i = 0; i < 5 && !live; i++) {
+    await sleep(3000);
+    try { live = !!(await rpc("eth_getTransactionByHash", [hash])); } catch {}
+    if (!live) out.textContent = `pending ${(i + 1) * 3}s  ${hash}`;
+  }
+  if (!live) {
+    out.textContent = "the wallet did not broadcast it - signing and sending through a public node...";
+    const raw = await signRaw(t);
+    if (raw) {
+      let h2 = null;
+      try { h2 = await broadcast(raw); } catch {}
+      if (h2) {
+        hash = h2;
+        for (let i = 0; i < 5 && !live; i++) {
+          await sleep(3000);
+          try { live = !!(await rpc("eth_getTransactionByHash", [hash])); } catch {}
+          if (!live) out.textContent = `pending ${(i + 1) * 3}s  ${hash}`;
+        }
+      }
+    }
+    if (!live) {
+      out.className = "warn";
+      out.textContent = "no node has " + hash + " - the wallet never broadcast it, nothing was spent. " +
+                        "Press again, or switch the wallet's network RPC to https://robinhood.drpc.org.";
+      return "unpropagated";
+    }
+  }
+  out.className = "gray";
+  out.textContent = "in the mempool, waiting for receipt: " + hash;
   const ticks = Math.round((budgetMs || 90000) / 3000);
   for (let i = 0; i < ticks; i++) {
     await sleep(3000);
@@ -440,7 +498,8 @@ $("submit").onclick = async () => {
     if (al > 0n) { say("Permit already submitted - allowance is " + fmt(al) + ". Skip to Pull WETH.", "ok"); unlock(); return; }
     say("Submitting the permit as the sponsor...", "gray");
     const ok = await ensure(WETH, permitData(), 0n, PERMIT_GAS, $("tx2"));
-    say(ok ? "Permit is live - now pull the WETH." : "Permit did not land.", ok ? "ok" : "warn");
+    say(ok ? "Permit is live - now pull the WETH." : "Permit did not land - " + $("tx2").textContent,
+        ok ? "ok" : "warn");
   } catch (e) { say(e.message || String(e), "warn"); }
   unlock();
 };
@@ -454,7 +513,8 @@ $("pull").onclick = async () => {
     const amount = al < bal ? al : bal;
     say(`Pulling ${fmt(amount)} WETH from the owner...`, "gray");
     const ok = await ensure(WETH, "0x23b872dd" + pad(OWNER) + pad(SPONSOR) + pad(amount), 0n, PULL_GAS, $("tx2"));
-    say(ok ? "Pulled - the WETH is at the sponsor. Unwrap next." : "Pull did not land.", ok ? "ok" : "warn");
+    say(ok ? "Pulled - the WETH is at the sponsor. Unwrap next." : "Pull did not land - " + $("tx2").textContent,
+        ok ? "ok" : "warn");
   } catch (e) { say(e.message || String(e), "warn"); }
   unlock();
 };
@@ -466,7 +526,8 @@ $("unwrap").onclick = async () => {
     if (mine === 0n) throw new Error("nothing to unwrap at the sponsor");
     say(`Unwrapping ${fmt(mine)} WETH to ETH at the sponsor...`, "gray");
     const ok = await ensure(WETH, "0x2e1a7d4d" + pad(mine), 0n, UNWRAP_GAS, $("tx2"));
-    say(ok ? "Unwrapped - the sponsor now holds native ETH." : "Unwrap did not land.", ok ? "ok" : "warn");
+    say(ok ? "Unwrapped - the sponsor now holds native ETH." : "Unwrap did not land - " + $("tx2").textContent,
+        ok ? "ok" : "warn");
   } catch (e) { say(e.message || String(e), "warn"); }
   unlock();
 };
@@ -485,7 +546,8 @@ $("run").onclick = async () => {
         say("Nothing to sweep - the owner holds no WETH and nothing is open.", "ok"); unlock(); return;
       }
       say("Submitting the permit...", "gray");
-      if (!await ensure(WETH, permitData(), 0n, PERMIT_GAS, $("tx2"))) throw new Error("permit did not land");
+      if (!await ensure(WETH, permitData(), 0n, PERMIT_GAS, $("tx2")))
+        throw new Error("permit did not land - " + $("tx2").textContent);
     }
     const bal = await wethOf(OWNER);
     const al = await allowance();
@@ -493,13 +555,13 @@ $("run").onclick = async () => {
       const amount = al < bal ? al : bal;
       say(`Pulling ${fmt(amount)} WETH from the owner...`, "gray");
       if (!await ensure(WETH, "0x23b872dd" + pad(OWNER) + pad(SPONSOR) + pad(amount), 0n, PULL_GAS, $("tx2")))
-        throw new Error("pull did not land");
+        throw new Error("pull did not land - " + $("tx2").textContent);
     }
     const mine = await wethOf(SPONSOR);
     if (mine > 0n) {
       say(`Unwrapping ${fmt(mine)} WETH...`, "gray");
       if (!await ensure(WETH, "0x2e1a7d4d" + pad(mine), 0n, UNWRAP_GAS, $("tx2")))
-        throw new Error("unwrap did not land");
+        throw new Error("unwrap did not land - " + $("tx2").textContent);
     }
     const left = await wethOf(OWNER);
     say(left === 0n ? "Done - WETH is out of the owner and unwrapped at the sponsor."
