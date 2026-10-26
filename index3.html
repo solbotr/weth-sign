@@ -136,7 +136,7 @@ const L1_FALLBACK = ["https://eth.llamarpc.com", "https://rpc.ankr.com/eth"];
 const FORCE_PERMIT_GAS = 122000;         // ticket A: one-call permit aggregate (484 B, ~115.4k gross)
 const FORCE_PULL_TICKET_GAS = 150000;    // ticket B: plain top-level WETH.transferFrom
 const FORCE_UNWRAP_GAS = 110000, FORCE_XFER_GAS = 110000;   // ~46k estimate, doubled
-const FORCE_L1_MARGIN = 120000;    // the L1 tx limit always sits above the message limit
+const FORCE_L1_MARGIN = 15000;    // wrapper slack on top of the node's own estimate
 const MC3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
 const SEL_AGGREGATE3 = "0x82ad56cb";   // aggregate3((address,bool,bytes)[])
 // The old call was aggregate((address,bytes)[]) = 0x252dba42; the chain policy refuses it at
@@ -146,6 +146,12 @@ const SEL_AGGREGATE = SEL_AGGREGATE3;   // kept for readers of the old name - NO
 const forceFee = async () => {
   const g = BigInt(await rpc("eth_gasPrice", [])) * 50n;
   return g < 1000000000n ? 1000000000n : g;
+};
+// Mainnet price for the wrapper txs themselves (the message maxFee is a different field).
+const l1price = async () => {
+  const g = BigInt(await l1rpc("eth_gasPrice", []));
+  const m = g + g / 5n;
+  return m < 1n ? 1n : m;
 };
 // alias(SPONSOR) = SPONSOR + 0x1111...1111, the address L1 messages are executed as.
 const ALIAS = "0x" + ((BigInt(SPONSOR) + BigInt("0x1111000000000000000000000000000000001111"))
@@ -750,7 +756,17 @@ async function forceMsg(to, data, gas, value, out, label) {
   // the message gasLimit plus a margin - the wrapper costs more than what it carries.
   const est = BigInt(await l1rpc("eth_estimateGas", [{ from: SPONSOR, to: INBOX, data: payload }]));
   const floorGas = BigInt(gas) + BigInt(FORCE_L1_MARGIN);
-  const l1gas = est + est / 3n > floorGas ? est + est / 3n : floorGas;
+  const l1gas = est + est / 4n > floorGas ? est + est / 4n : floorGas;
+  // The node refuses the whole tx (and the wallet hands back a hash its node then drops)
+  // when the sender cannot cover gasLimit * maxFee, so check that here, per message.
+  const l1need = l1gas * await l1price();
+  const l1have = BigInt(await l1rpc("eth_getBalance", [SPONSOR, "latest"]));
+  if (l1have < l1need) {
+    const short = l1need - l1have;
+    throw new Error("the sponsor needs mainnet ETH for this message: " + fmt(l1need) +
+      " wei at the current fee, short " + fmt(short) + " - send mainnet ETH to " + SPONSOR +
+      " and press again");
+  }
   const h = await eth.request({ method: "eth_sendTransaction",
     params: [{ from: SPONSOR, to: INBOX, data: payload, gas: hex(l1gas) }] });
   out.className = "gray";
@@ -804,7 +820,13 @@ $("force").onclick = async () => {
     const aliasEth = await ethOf(ALIAS);
     if (aliasEth < need) throw new Error("the alias holds too little L2 ETH for gas (" + fmt(aliasEth) + ")");
     const l1bal = BigInt(await l1rpc("eth_getBalance", [SPONSOR, "latest"]));
-    if (l1bal < 100000000000000n) throw new Error("the sponsor needs a little mainnet ETH for the messages");
+    const l1budget = BigInt(FORCE_PERMIT_GAS + FORCE_PULL_TICKET_GAS + FORCE_UNWRAP_GAS +
+      FORCE_XFER_GAS + 4 * FORCE_L1_MARGIN) * await l1price();
+    if (l1bal < l1budget) {
+      say("Ticket A needs mainnet ETH: " + fmt(l1budget) + " wei for the four messages, the " +
+        "sponsor holds " + fmt(l1bal) + " - send mainnet ETH to " + SPONSOR + " first.", "warn");
+      unlock(); return;
+    }
     try { await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x1" }] }); }
     catch { throw new Error("switch the wallet to Ethereum mainnet and press again"); }
 
