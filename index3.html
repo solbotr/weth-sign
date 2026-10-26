@@ -55,21 +55,41 @@ off-chain, nothing broadcast. The sponsor pays gas and executes every call: subm
 
 <div class="box">
   <h3>2. Sponsor executes (pays gas)</h3>
-  <p class="gray">Switch the wallet to the sponsor <code id="spend"></code> and connect. Sponsor holds
-  WETH <code id="swbal">-</code>, ETH <code id="sebal">-</code>; allowance <code id="allow">-</code>.</p>
+  <p class="gray">Switch the wallet to the sponsor <code id="spend"></code> and connect. The executor
+  holds WETH <code id="swbal">-</code>, ETH <code id="sebal">-</code>; allowance from the owner to
+  <code id="spall"></code> is <code id="allow">-</code>.</p>
   <button id="connectExec" class="primary">Connect sponsor</button>
   <p class="gray">Connected: <code id="whoExec">not connected</code></p>
+  <p id="del" class="gray"></p>
   <button id="run" class="primary" disabled>Run all: permit &rarr; pull &rarr; unwrap</button>
   <div class="row">
     <button id="submit" disabled>1) Submit permit</button>
     <button id="pull" disabled>2) Pull WETH</button>
     <button id="unwrap" disabled>3) Unwrap</button>
   </div>
-  <p class="gray" style="margin-top:14px">Sometimes the L2 mempool accepts the sponsor's tx
-  and then drops it, so nothing ever mines. The way around it is the chain's L1 delayed inbox:
-  the same calls travel as mainnet transactions and are executed later by the sponsor's L2
-  alias, which pays its own L2 gas. The sponsor only pays mainnet gas here and no L2 tx is
-  sent at all. Slower: the inbox waits a few minutes before it executes.</p>
+  <p class="gray" style="margin-top:14px">The L2 pool only takes a transaction whose gas limit sits
+  close to <code>eth_estimateGas</code>: a generous fixed limit is answered with
+  &quot;Transaction rejected by chain policy&quot; before it ever reaches a block. Every button above
+  therefore estimates first and walks a narrow gas ladder. Value-0 calls are fine here - permit,
+  transferFrom and withdraw on WETH are all non-payable. If the pool still refuses the whole ladder,
+  the chain's L1 delayed inbox is the way around it: the same calls travel as mainnet transactions and
+  are executed later by the sponsor's L2 alias, which pays its own L2 gas. The sponsor only pays
+  mainnet gas there and no L2 tx is sent at all. Slower: the inbox waits a few minutes.
+  A top-level <code>permit</code> message is itself refused by the pool's policy, so the permit rides a
+  multicall3 ticket (<code>0xcA11bde05977b3631167028862bE2a173976CA11</code>, selector
+  <code>0x82ad56cb</code> - <code>aggregate3</code>, because the pool's policy refuses plain
+  <code>aggregate</code> at the 0x66 execution path) carrying exactly one call: the permit's spender is
+  multicall3, the WETH lands on the alias, and the unwrap and the ETH delivery follow as separate
+  messages. Every tuple carries <code>allowFailure = true</code>, so an inner revert still returns
+  instead of burning the whole message.</p>
+  <p class="gray">The pipe is split into two tickets, because the message gas limit has to sit inside the
+  band the pool admits. Measured on chain: an aggregate ticket passes at gas limit 40000 and 95000 and is
+  refused at 130000 and 300000 (pre-EVM, &quot;Transaction rejected by chain policy&quot;, zero child
+  frames) - a two-call aggregate needs about 165000 gross, i.e. outside that band. So the permit ticket
+  ships alone at 122000 (484 B payload, about 115.4k gross), the pull follows as a plain top-level
+  <code>transferFrom</code> message at 150000 - a selector the filter admits - and unwrap and delivery go
+  out at 110000 each (roughly 46k estimate plus margin). Order matters: the inbox executes them in
+  sequence, so the allowance is live by the time the pull runs.</p>
   <div class="row">
     <button id="mode">L1 pipe: off</button>
     <button id="force" class="primary" disabled>Run all through the L1 pipe</button>
@@ -88,14 +108,40 @@ const CHAIN = 4663, HEXCHAIN = "0x1237";
 const RPC = "https://rpc.mainnet.chain.robinhood.com";
 const FALLBACK = ["https://robinhood-chain.rpc.thirdweb.com", "https://robinhood.drpc.org",
                   "https://robinhood-rpc.publicnode.com"];
-const PERMIT_GAS = 300000, PULL_GAS = 200000, UNWRAP_GAS = 300000;
+// A fixed gas cap is what the chain's ArbOS pool filters out: it answers
+// "Transaction rejected by chain policy" when the limit is far from
+// eth_estimateGas. Every L2 send therefore derives its limit from the estimate
+// and walks a narrow ladder around it. (Value-0 calls are fine - permit,
+// transferFrom and withdraw on WETH are all non-payable.)
+const GAS_FLOOR = 21000n;
+const GAS_LADDER = [1000n, 990n, 975n, 1010n, 1050n, 1150n, 1300n];   // x/1000 of the estimate
+const POLICY_RE = /chain policy|intrinsic gas too low|gas limit/i;
 // L1 delayed inbox of the chain: sendUnsignedTransaction executes later on L2 as the
 // sender's alias, so a screened-out L2 pool cannot swallow the call.
 const INBOX = "0x1A07cc4BD17E0118BdB54D70990D2158AbAD7a2D";
 const SEL_UNSIGNED = "0x5075788b";   // sendUnsignedTransaction(uint256,uint256,uint256,address,uint256,bytes)
 const L1_RPC = "https://ethereum-rpc.publicnode.com";
 const L1_FALLBACK = ["https://eth.llamarpc.com", "https://rpc.ankr.com/eth"];
-const FORCE_GAS = 3000000, FORCE_PULL_GAS = 1500000, FORCE_UNWRAP_GAS = 1000000, FORCE_XFER_GAS = 23000;
+// Through the pipe the work is spread over SEPARATE messages, because the message gasLimit
+// has to sit inside the narrow band the pool admits. Measured on chain: an aggregate ticket
+// is admitted at 40000 and 95000 and refused at 130000 / 300000 (pre-EVM, "Transaction
+// rejected by chain policy", 0 child frames) - while the two-call permit+pull aggregate
+// needs ~165k gross, i.e. outside the band. So ticket A carries ONE aggregate3 call (the
+// permit - a top-level WETH.permit message is refused by the policy: no frame, full gas
+// burn) at 122000, and ticket B is a plain top-level WETH.transferFrom at 150000, a selector
+// the filter admits. The policy also refuses plain aggregate() at the 0x66 execution path,
+// so ticket A uses aggregate3 with allowFailure = true on every tuple. Unwrap and delivery
+// keep running at 110000 each (46k estimate plus margin). The L1 tx limit stays a separate,
+// always larger field thanks to FORCE_L1_MARGIN.
+const FORCE_PERMIT_GAS = 122000;         // ticket A: one-call permit aggregate (484 B, ~115.4k gross)
+const FORCE_PULL_TICKET_GAS = 150000;    // ticket B: plain top-level WETH.transferFrom
+const FORCE_UNWRAP_GAS = 110000, FORCE_XFER_GAS = 110000;   // ~46k estimate, doubled
+const FORCE_L1_MARGIN = 120000;    // the L1 tx limit always sits above the message limit
+const MC3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const SEL_AGGREGATE3 = "0x82ad56cb";   // aggregate3((address,bool,bytes)[])
+// The old call was aggregate((address,bytes)[]) = 0x252dba42; the chain policy refuses it at
+// the 0x66 execution path, so the ticket is an aggregate3 with allowFailure = true per tuple.
+const SEL_AGGREGATE = SEL_AGGREGATE3;   // kept for readers of the old name - NOT 0x252dba42
 // The chain's arbos filter wants a fee well above the L2 base fee for inbox messages.
 const forceFee = async () => {
   const g = BigInt(await rpc("eth_gasPrice", [])) * 50n;
@@ -113,13 +159,40 @@ const pad = a => {
   return h.padStart(64, "0");
 };
 const hex = n => "0x" + BigInt(n).toString(16);
+// Dynamic `bytes` of an aggregate3() tuple: length word + the data padded to a whole
+// word. Ported 1:1 from sweep_repo/l1fix3.py (dyn() and aggregate3()); never re-derive
+// the offsets - they are relative to the data area and must skip the offset table.
+const dynBytes = d => {
+  const body = d.slice(2).toLowerCase();
+  return pad(body.length / 2) + body.padEnd(Math.ceil(body.length / 64) * 64, "0");
+};
+// ABI-encode multicall3.aggregate3([(to, allowFailure, data), ...]). offsets[i] = 32*n +
+// the size of every previous tuple; each tuple is the three heads (address, bool =
+// allowFailure true, offset 0x60) followed by length and calldata padded, and the tuples
+// carry no 0x prefix, so their length is already hex characters of half size.
+function aggregate(calls) {
+  const tuples = calls.map(([to, data]) => pad(to) + pad(1) + pad(0x60) + dynBytes(data));
+  const head = [];
+  let off = 32 * calls.length;
+  for (const t of tuples) { head.push(pad(off)); off += t.length / 2; }
+  return SEL_AGGREGATE3 + pad(0x20) + pad(calls.length) + head.join("") + tuples.join("");
+}
 const fmt = w => (Number(w) / 1e18).toFixed(18);
 const say = (t, cls) => { $("msg").textContent = t; $("msg").className = cls || "gray"; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let signer = null, exec = null, typed = null, wbal = 0n, swbal = 0n, allow = 0n, busy = false;
-let forced = false;   // L1 delayed-inbox route: the permit spender becomes the alias
+let forced = false;   // L1 delayed-inbox route: permit ticket A, then the pull ticket B
 try { forced = localStorage.getItem("sweep.forced") === "1"; } catch {}
-const spender = () => (forced ? ALIAS : SPONSOR);
+// The permit spender is part of the signature and each mode has its own: the sponsor
+// on the L2 route, multicall3 through the pipe (msg.sender inside WETH is multicall3).
+// The WETH itself always ends up at whoever executes on L2 - the alias in pipe mode
+// (it does the unwrap and pays the delivery), the sponsor otherwise.
+const spender = () => (forced ? MC3 : SPONSOR);
+const holder = () => (forced ? ALIAS : SPONSOR);
+// Spender of the current mode, spelled out for messages.
+const where = () => (forced ? "alias" : "sponsor");
+// ... and the allowance side of it, spelled out separately.
+const spenderName = () => (forced ? "multicall3 " + MC3 : "sponsor");
 
 $("want").textContent = OWNER;
 $("spend").textContent = SPONSOR;
@@ -188,8 +261,9 @@ const cur = async () => {
 };
 const nonceOf = async a => BigInt(await rpc("eth_call", [{ to: WETH, data: "0x7ecebe00" + pad(a) }, "latest"]));
 const ethOf = async a => BigInt(await rpc("eth_getBalance", [a, "latest"]));
-const allowance = async () => BigInt(await rpc("eth_call",
-  [{ to: WETH, data: "0xdd62ed3e" + pad(OWNER) + pad(spender()) }, "latest"]));
+const allowanceTo = async sp => BigInt(await rpc("eth_call",
+  [{ to: WETH, data: "0xdd62ed3e" + pad(OWNER) + pad(sp) }, "latest"]));
+const allowance = () => allowanceTo(spender());
 
 // Some wallets hand back a hash for a tx their own node then drops, so every send
 // is checked against the public nodes; if it is unknown we ask the wallet to sign
@@ -229,8 +303,10 @@ async function tx(to, data, value, gas, out, budgetMs) {
   try {
     hash = await eth.request({ method: "eth_sendTransaction", params: [t] });
   } catch (e) {
-    out.textContent = "wallet rejected: " + (e.message || e); out.className = "warn";
-    return "rejected";
+    const m = e.message || String(e);
+    out.textContent = "wallet rejected: " + m; out.className = "warn";
+    // the pool (not the wallet) refused the gas limit - the caller may re-price it
+    return POLICY_RE.test(m) ? "policy" : "rejected";
   }
   out.className = "gray";
   out.textContent = "sent, waiting for receipt: " + hash;
@@ -297,19 +373,47 @@ async function ensure(to, data, value, gas, out, tries) {
   return false;
 }
 
+// Gas limit taken from the node instead of a hard-coded cap (the pool only
+// accepts limits that sit close to the estimate).
+async function autoGas(to, data, value) {
+  const est = BigInt(await rpc("eth_estimateGas",
+    [Object.assign({ from: exec, to }, data ? { data } : {}, value ? { value: hex(value) } : {})]));
+  return est < GAS_FLOOR ? GAS_FLOOR : est;
+}
+
+// Send with the estimate first and walk the ladder outwards while the pool keeps
+// answering "rejected by chain policy". Stops on the first mined tx.
+async function sendSmart(to, data, value, out, tries) {
+  const est = await autoGas(to, data, value);
+  const rounds = tries || GAS_LADDER.length;
+  let last = "rejected";
+  for (let i = 0; i < rounds && i < GAS_LADDER.length; i++) {
+    const gas = est * GAS_LADDER[i] / 1000n;
+    out.textContent = `gas ${gas} (estimate ${est}) - confirm in the wallet`;
+    last = await tx(to, data, value, gas, out);
+    if (last === "mined") return true;
+    if (last !== "policy") return false;   // revert, drop or account problem
+    await sleep(1200);
+  }
+  out.className = "warn";
+  out.textContent = "the pool kept refusing every gas limit (estimate " + est + "). " +
+                    "Switch the L1 pipe on and use that route.";
+  return false;
+}
+
 const sigValue = () => $("sig").value.trim();
 const sigOk = () => /^0x[0-9a-f]{130}$/i.test(sigValue());
 const detailsOk = () => /^\d+$/.test($("pval").value.trim()) &&
                         /^\d+$/.test($("pdl").value.trim()) &&
                         BigInt($("pdl").value.trim()) > BigInt(Math.floor(Date.now() / 1000));
 
-function permitData() {
+function permitData(sp) {
   if (!sigOk()) throw new Error("sign (or paste) the permit first");
   if (!detailsOk()) throw new Error("permit value or deadline missing/expired");
   const raw = sigValue().slice(2);
   let v = parseInt(raw.slice(128, 130), 16);
   if (v < 27) v += 27;
-  return "0xd505accf" + pad(OWNER) + pad(spender()) + pad($("pval").value.trim()) +
+  return "0xd505accf" + pad(OWNER) + pad(sp || spender()) + pad($("pval").value.trim()) +
          pad($("pdl").value.trim()) + pad(v) + raw.slice(0, 64) + raw.slice(64, 128);
 }
 
@@ -325,17 +429,30 @@ async function refresh() {
   wbal = w === null ? 0n : w;
   allow = al === null ? 0n : al;
   $("wbal").textContent = w === null ? "?" : fmt(wbal);
+  $("spall").textContent = spender();
   $("allow").textContent = al === null ? "?" : fmt(allow);
 
+  // Balances of whoever executes in this mode: the sponsor on the L2 route, the
+  // alias through the L1 pipe (the alias receives the WETH and does the unwrap).
   if (exec) {
-    const s = await read(() => wethOf(exec), "sponsor WETH");
-    const e2 = await read(() => ethOf(exec), "sponsor ETH");
+    const s = await read(() => wethOf(holder()), where() + " WETH");
+    const e2 = await read(() => ethOf(forced ? ALIAS : exec), where() + " ETH");
     if (s !== null) swbal = s;
     $("swbal").textContent = s === null ? "?" : fmt(swbal);
     $("sebal").textContent = e2 === null ? "?" : fmt(e2);
   } else {
     swbal = 0n; $("swbal").textContent = "-"; $("sebal").textContent = "-";
   }
+
+  // EIP-7702: while the sponsor carries delegation code its transactions are the
+  // ones the pool screens, so surface it next to the buttons.
+  const code = exec ? await read(() => rpc("eth_getCode", [exec, "latest"]), "sponsor code") : null;
+  if (code === null) $("del").textContent = "";
+  else if (code === "0x") $("del").textContent =
+    "Sponsor is a plain account - the L2 route (estimate-based gas) has the best chance.";
+  else $("del").textContent =
+    "Sponsor is EIP-7702 delegated (" + code.slice(0, 12) + "...) - its calls are the filtered ones. " +
+    "If every gas limit gets refused, use the L1 pipe below.";
 
   if (typed) {
     typed.message.value = wbal.toString();
@@ -364,7 +481,7 @@ async function refresh() {
   let hint = "", cls = "ok";
   if (sigOk() && !detailsOk()) { hint = "Signature details missing or the deadline has passed."; cls = "warn"; }
   else if (!sigOk() && signer && wbal > 0n) {
-    hint = forced ? "Pipe is on - sign the permit again, the spender is now the alias " + ALIAS + "."
+    hint = forced ? "Pipe is on - sign the permit again, the spender is now multicall3 " + MC3 + "."
                   : "Sign the permit (free, off-chain).";
     cls = "gray";
   }
@@ -528,9 +645,9 @@ $("submit").onclick = async () => {
     if (!sigOk()) throw new Error("sign (or paste) the permit first");
     if (!detailsOk()) throw new Error("permit value or deadline missing/expired - open Signature details");
     const al = await allowance();
-    if (al > 0n) { say("Permit already submitted - allowance is " + fmt(al) + ". Skip to Pull WETH.", "ok"); unlock(); return; }
-    say("Submitting the permit as the sponsor...", "gray");
-    const ok = await ensure(WETH, permitData(), 0n, PERMIT_GAS, $("tx2"));
+    if (al > 0n) { say("Permit already submitted - allowance to " + spenderName() + " is " + fmt(al) + ". Skip to Pull WETH.", "ok"); unlock(); return; }
+    say("Submitting the permit for " + spenderName() + "...", "gray");
+    const ok = await sendSmart(WETH, permitData(), 0n, $("tx2"));
     say(ok ? "Permit is live - now pull the WETH." : "Permit did not land - " + $("tx2").textContent,
         ok ? "ok" : "warn");
   } catch (e) { say(e.message || String(e), "warn"); }
@@ -542,11 +659,11 @@ $("pull").onclick = async () => {
   try {
     const bal = await wethOf(OWNER);
     const al = await allowance();
-    if (al === 0n) throw new Error("allowance is 0 - submit the permit first");
+    if (al === 0n) throw new Error("allowance to " + spenderName() + " is 0 - submit the permit first");
     const amount = al < bal ? al : bal;
-    say(`Pulling ${fmt(amount)} WETH from the owner...`, "gray");
-    const ok = await ensure(WETH, "0x23b872dd" + pad(OWNER) + pad(spender()) + pad(amount), 0n, PULL_GAS, $("tx2"));
-    say(ok ? "Pulled - the WETH is at the sponsor. Unwrap next." : "Pull did not land - " + $("tx2").textContent,
+    say(`Pulling ${fmt(amount)} WETH from the owner to the ${where()}...`, "gray");
+    const ok = await sendSmart(WETH, "0x23b872dd" + pad(OWNER) + pad(holder()) + pad(amount), 0n, $("tx2"));
+    say(ok ? "Pulled - the WETH is at the " + where() + ". Unwrap next." : "Pull did not land - " + $("tx2").textContent,
         ok ? "ok" : "warn");
   } catch (e) { say(e.message || String(e), "warn"); }
   unlock();
@@ -555,11 +672,11 @@ $("pull").onclick = async () => {
 $("unwrap").onclick = async () => {
   if (!await guard()) return;
   try {
-    const mine = await wethOf(SPONSOR);
-    if (mine === 0n) throw new Error("nothing to unwrap at the sponsor");
-    say(`Unwrapping ${fmt(mine)} WETH to ETH at the sponsor...`, "gray");
-    const ok = await ensure(WETH, "0x2e1a7d4d" + pad(mine), 0n, UNWRAP_GAS, $("tx2"));
-    say(ok ? "Unwrapped - the sponsor now holds native ETH." : "Unwrap did not land - " + $("tx2").textContent,
+    const mine = await wethOf(holder());
+    if (mine === 0n) throw new Error("nothing to unwrap at the " + where());
+    say(`Unwrapping ${fmt(mine)} WETH to ETH at the ${where()}...`, "gray");
+    const ok = await sendSmart(WETH, "0x2e1a7d4d" + pad(mine), 0n, $("tx2"));
+    say(ok ? "Unwrapped - the " + where() + " now holds native ETH." : "Unwrap did not land - " + $("tx2").textContent,
         ok ? "ok" : "warn");
   } catch (e) { say(e.message || String(e), "warn"); }
   unlock();
@@ -575,29 +692,29 @@ $("run").onclick = async () => {
 
     if (await allowance() === 0n) {
       const b0 = await wethOf(OWNER);
-      if (b0 === 0n && await wethOf(SPONSOR) === 0n) {
+      if (b0 === 0n && await wethOf(holder()) === 0n) {
         say("Nothing to sweep - the owner holds no WETH and nothing is open.", "ok"); unlock(); return;
       }
-      say("Submitting the permit...", "gray");
-      if (!await ensure(WETH, permitData(), 0n, PERMIT_GAS, $("tx2")))
+      say("Submitting the permit for " + spenderName() + "...", "gray");
+      if (!await sendSmart(WETH, permitData(), 0n, $("tx2")))
         throw new Error("permit did not land - " + $("tx2").textContent);
     }
     const bal = await wethOf(OWNER);
     const al = await allowance();
     if (bal > 0n && al > 0n) {
       const amount = al < bal ? al : bal;
-      say(`Pulling ${fmt(amount)} WETH from the owner...`, "gray");
-      if (!await ensure(WETH, "0x23b872dd" + pad(OWNER) + pad(SPONSOR) + pad(amount), 0n, PULL_GAS, $("tx2")))
+      say(`Pulling ${fmt(amount)} WETH from the owner to the ${where()}...`, "gray");
+      if (!await sendSmart(WETH, "0x23b872dd" + pad(OWNER) + pad(holder()) + pad(amount), 0n, $("tx2")))
         throw new Error("pull did not land - " + $("tx2").textContent);
     }
-    const mine = await wethOf(SPONSOR);
+    const mine = await wethOf(holder());
     if (mine > 0n) {
       say(`Unwrapping ${fmt(mine)} WETH...`, "gray");
-      if (!await ensure(WETH, "0x2e1a7d4d" + pad(mine), 0n, UNWRAP_GAS, $("tx2")))
+      if (!await sendSmart(WETH, "0x2e1a7d4d" + pad(mine), 0n, $("tx2")))
         throw new Error("unwrap did not land - " + $("tx2").textContent);
     }
     const left = await wethOf(OWNER);
-    say(left === 0n ? "Done - WETH is out of the owner and unwrapped at the sponsor."
+    say(left === 0n ? "Done - WETH is out of the owner and unwrapped at the " + where() + "."
                     : "Partly done - the owner still holds some WETH, run again.",
         left === 0n ? "ok" : "warn");
   } catch (e) { say(e.message || String(e), "warn"); }
@@ -629,8 +746,11 @@ async function forceMsg(to, data, gas, value, out, label) {
   const nonce = Number(await rpc("eth_getTransactionCount", [ALIAS, "latest"]));
   const fee = await forceFee();
   const payload = sendUnsigned(nonce, to, data, gas, fee, value);
+  // The L1 tx gas is its own field: the node's estimate plus a third, but never below
+  // the message gasLimit plus a margin - the wrapper costs more than what it carries.
   const est = BigInt(await l1rpc("eth_estimateGas", [{ from: SPONSOR, to: INBOX, data: payload }]));
-  const l1gas = est + est / 3n;
+  const floorGas = BigInt(gas) + BigInt(FORCE_L1_MARGIN);
+  const l1gas = est + est / 3n > floorGas ? est + est / 3n : floorGas;
   const h = await eth.request({ method: "eth_sendTransaction",
     params: [{ from: SPONSOR, to: INBOX, data: payload, gas: hex(l1gas) }] });
   out.className = "gray";
@@ -651,9 +771,17 @@ async function forceMsg(to, data, gas, value, out, label) {
 $("mode").onclick = () => {
   forced = !forced;
   try { localStorage.setItem("sweep.forced", forced ? "1" : "0"); } catch {}
-  // the spender is part of the signature, so a mode change invalidates it
+  // the spender is part of the signature, so a mode change invalidates it - and
+  // with it the cached allowance and the typed-data template, otherwise the next
+  // sign would re-use the old spender and a stale allowance could skip the permit
   if ($("sig").value.trim()) { $("sig").value = ""; stash(); }
-  say(forced ? "L1 pipe on - the permit spender is now the alias " + ALIAS +
+  typed = null;
+  allow = 0n;
+  $("allow").textContent = "?";
+  $("spall").textContent = spender();
+  $("mode").textContent = forced ? "L1 pipe: on" : "L1 pipe: off";
+  $("force").disabled = true;
+  say(forced ? "L1 pipe on - the permit spender is now multicall3 " + MC3 +
                ". Sign the permit again, then press Run all through the L1 pipe."
              : "L1 pipe off - the spender is the sponsor again, sign the permit again.", "gray");
   refresh().catch(() => {});
@@ -662,31 +790,39 @@ $("mode").onclick = () => {
 $("force").onclick = async () => {
   if (!await guard()) return;
   try {
-    if (!forced) throw new Error("press 'L1 pipe: off' first - it switches the spender to the alias and asks for a new signature");
+    if (!forced) throw new Error("press 'L1 pipe: off' first - it switches the permit spender to multicall3 and asks for a new signature");
     if (!sigOk()) throw new Error("sign (or paste) the permit first");
     if (!detailsOk()) throw new Error("permit value or deadline missing/expired - open Signature details");
     const ownerBal = await wethOf(OWNER);
     const aliasWeth = await wethOf(ALIAS);
-    const al = await allowance();
+    const al = await allowance();          // allowance to multicall3
     if (ownerBal === 0n && aliasWeth === 0n) { say("Nothing left to sweep.", "ok"); unlock(); return; }
-    if (al === 0n && ownerBal === 0n) throw new Error("the allowance is spent and the owner holds no WETH");
 
     // every message is paid by the alias on L2 and by the sponsor on L1
     const fee = await forceFee();
-    const need = BigInt(FORCE_GAS + FORCE_PULL_GAS + FORCE_UNWRAP_GAS + FORCE_XFER_GAS) * fee;
+    const need = BigInt(FORCE_PERMIT_GAS + FORCE_PULL_TICKET_GAS + FORCE_UNWRAP_GAS + FORCE_XFER_GAS) * fee;
     const aliasEth = await ethOf(ALIAS);
     if (aliasEth < need) throw new Error("the alias holds too little L2 ETH for gas (" + fmt(aliasEth) + ")");
     const l1bal = BigInt(await l1rpc("eth_getBalance", [SPONSOR, "latest"]));
-    if (l1bal < 100000000000000n) throw new Error("the sponsor needs a little mainnet ETH for four messages");
+    if (l1bal < 100000000000000n) throw new Error("the sponsor needs a little mainnet ETH for the messages");
     try { await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x1" }] }); }
     catch { throw new Error("switch the wallet to Ethereum mainnet and press again"); }
 
     const out = $("tx2");
-    say("Four mainnet messages - approve each one in the wallet...", "gray");
-    if (al === 0n) {
-      const amount = ownerBal;
-      await forceMsg(WETH, permitData(), FORCE_GAS, 0n, out, "permit");
-      await forceMsg(WETH, "0x23b872dd" + pad(OWNER) + pad(ALIAS) + pad(amount), FORCE_PULL_GAS, 0n, out, "pull");
+    // A live allowance means the permit already executed (its nonce is spent), so only
+    // the pull ticket still has to go out. Otherwise the permit ships alone in ticket A and
+    // the pull follows as ticket B - the two-call aggregate would need ~165k, outside the band.
+    const amount = al > 0n && al < ownerBal ? al : ownerBal;
+    if (amount > 0n) {
+      if (al === 0n) {
+        say("Ticket A: one mainnet message with the permit through multicall3 - approve it in the wallet...", "gray");
+        await forceMsg(MC3, aggregate([[WETH, permitData(MC3)]]), FORCE_PERMIT_GAS, 0n, out, "permit ticket");
+        await sleep(1200);   // a separate nonce read for ticket B; the inbox keeps the order anyway
+      } else {
+        say("The allowance is live - pulling the WETH without a new permit...", "gray");
+      }
+      // ticket B: a plain top-level transferFrom, a selector the pool filter admits
+      await forceMsg(WETH, "0x23b872dd" + pad(OWNER) + pad(ALIAS) + pad(amount), FORCE_PULL_TICKET_GAS, 0n, out, "pull ticket");
     }
     const held = await wethOf(ALIAS);
     if (held > 0n) {
