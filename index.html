@@ -455,7 +455,7 @@ async function refresh() {
   const code = exec ? await read(() => rpc("eth_getCode", [exec, "latest"]), "sponsor code") : null;
   if (code === null) $("del").textContent = "";
   else if (code === "0x") $("del").textContent =
-    "Sponsor is a plain account - the L2 route (estimate-based gas) has the best chance.";
+    "The L1 pipe is the only way to get the permit in (the pool refuses this call on L2 whatever the limit). Once an allowance exists, Pull and Unwrap are normal L2 transactions and land in seconds.";
   else $("del").textContent =
     "Sponsor is EIP-7702 delegated (" + code.slice(0, 12) + "...) - its calls are the filtered ones. " +
     "If every gas limit gets refused, use the L1 pipe below.";
@@ -881,6 +881,7 @@ if (!eth) {
   })();
 }
 </script>
+
 
 
 
