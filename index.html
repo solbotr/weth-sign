@@ -133,7 +133,7 @@ const L1_FALLBACK = ["https://eth.llamarpc.com", "https://rpc.ankr.com/eth"];
 // so ticket A uses aggregate3 with allowFailure = true on every tuple. Unwrap and delivery
 // keep running at 110000 each (46k estimate plus margin). The L1 tx limit stays a separate,
 // always larger field thanks to FORCE_L1_MARGIN.
-const FORCE_PERMIT_GAS = 95000;         // ticket A: one-call permit aggregate (484 B, ~115.4k gross)
+const FORCE_PERMIT_GAS = 110000;         // ticket A: one-call permit aggregate (484 B, ~115.4k gross)
 const FORCE_PULL_TICKET_GAS = 150000;    // ticket B: plain top-level WETH.transferFrom
 const FORCE_UNWRAP_GAS = 110000, FORCE_XFER_GAS = 110000;   // ~46k estimate, doubled
 const FORCE_L1_MARGIN = 15000;    // wrapper slack on top of the node's own estimate
@@ -881,5 +881,6 @@ if (!eth) {
   })();
 }
 </script>
+
 
 
