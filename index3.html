@@ -471,8 +471,8 @@ async function refresh() {
   $("force").disabled = busy || !exec || !forced || !sigOk() || !detailsOk();
   $("sign").disabled = busy || !signer || wbal === 0n;
   $("submit").disabled = busy || !exec || !sigOk() || !detailsOk();
-  $("pull").disabled = busy || !exec || allow === 0n;      // armed by the allowance only
-  $("unwrap").disabled = busy || !exec || swbal === 0n;    // armed by WETH at the sponsor
+  $("pull").disabled = busy || !exec;      // always armed: the handler offers to run step 1
+  $("unwrap").disabled = busy || !exec;
   $("run").disabled = busy || !exec || !sigOk() || !detailsOk();
   $("again").disabled = false;
   if (busy) return;
@@ -662,7 +662,14 @@ $("pull").onclick = async () => {
   try {
     const bal = await wethOf(OWNER);
     const al = await allowance();
-    if (al === 0n) throw new Error("allowance to the sponsor is 0 - step 1 (the permit) has not run yet");
+    if (al === 0n) {
+      if (!forced) throw new Error("there is no allowance yet - switch the L1 pipe on and press 1) Permit over the L1 pipe");
+      if (bal === 0n) throw new Error("the owner holds no WETH - nothing to pull");
+      say("No allowance yet, so step 1 goes out first: one mainnet message with the permit...", "gray");
+      await sendPermitTicket();
+      say("Permit ticket queued. Nothing to pull until it executes (a few minutes) - then press 2) Pull WETH.", "ok");
+      unlock(); return;
+    }
     await onChain();
     const amount = al < bal ? al : bal;
     say(`Pulling ${fmt(amount)} WETH from the owner to the ${where()}...`, "gray");
@@ -677,7 +684,7 @@ $("unwrap").onclick = async () => {
   if (!await guard()) return;
   try {
     const mine = await wethOf(holder());
-    if (mine === 0n) throw new Error("nothing to unwrap at the sponsor");
+    if (mine === 0n) throw new Error("nothing at the sponsor yet - the pull has to land before the unwrap");
     await onChain();
     say(`Unwrapping ${fmt(mine)} WETH to ETH at the ${where()}...`, "gray");
     const ok = await sendSmart(WETH, "0x2e1a7d4d" + pad(mine), 0n, $("tx2"));
